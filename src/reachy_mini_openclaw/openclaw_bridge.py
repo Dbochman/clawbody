@@ -52,7 +52,7 @@ class OpenClawBridge:
         gateway_url: Optional[str] = None,
         gateway_token: Optional[str] = None,
         agent_id: Optional[str] = None,
-        timeout: float = 120.0,
+        timeout: float = 300.0,
     ):
         """Initialize the OpenClaw bridge.
 

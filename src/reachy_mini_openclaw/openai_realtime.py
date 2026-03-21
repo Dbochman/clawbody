@@ -432,8 +432,27 @@ OpenClaw has access to many capabilities you don't have directly.""",
     
     async def _handle_openclaw_query(self, args_json: str) -> dict:
         """Handle a query to OpenClaw."""
-        if self.openclaw_bridge is None or not self.openclaw_bridge.is_connected:
-            return {"error": "OpenClaw not connected"}
+        if self.openclaw_bridge is None:
+            return {
+                "error": "OpenClaw bridge is not initialized. "
+                "Tell the user you cannot reach your backend right now and to try again later."
+            }
+        if not self.openclaw_bridge.is_connected:
+            # Try to reconnect once
+            logger.info("OpenClaw bridge disconnected, attempting reconnect...")
+            try:
+                connected = await self.openclaw_bridge.connect()
+                if not connected:
+                    return {
+                        "error": "OpenClaw gateway is temporarily unreachable. "
+                        "Tell the user your backend connection is down and to try again in a moment."
+                    }
+            except Exception as e:
+                logger.error("OpenClaw reconnect failed: %s", e)
+                return {
+                    "error": "OpenClaw gateway reconnection failed. "
+                    "Tell the user your backend is temporarily unavailable."
+                }
             
         try:
             args = json.loads(args_json)
@@ -450,7 +469,8 @@ OpenClaw has access to many capabilities you don't have directly.""",
                     image_b64 = base64.b64encode(buffer).decode('utf-8')
                     logger.debug("Captured camera image for OpenClaw query")
             
-            # Query OpenClaw
+            # Query OpenClaw — this may take a while if the backend LLM is slow
+            logger.info("Sending ask_openclaw query: %s", query[:80])
             response = await self.openclaw_bridge.chat(
                 query, 
                 image_b64=image_b64,
@@ -458,12 +478,31 @@ OpenClaw has access to many capabilities you don't have directly.""",
             )
             
             if response.error:
-                return {"error": response.error}
+                logger.warning("OpenClaw query error: %s", response.error)
+                if "timeout" in response.error.lower():
+                    return {
+                        "error": "The request to OpenClaw timed out — the backend is taking too long. "
+                        "Tell the user you're having trouble reaching your backend and to try again."
+                    }
+                return {
+                    "error": f"OpenClaw returned an error: {response.error}. "
+                    "Tell the user there was a problem processing their request."
+                }
+            
+            if not response.content:
+                return {
+                    "error": "OpenClaw returned an empty response. "
+                    "Tell the user you got no data back and to try again."
+                }
+            
             return {"response": response.content}
             
         except Exception as e:
             logger.error("OpenClaw query failed: %s", e)
-            return {"error": str(e)}
+            return {
+                "error": f"OpenClaw query failed: {e}. "
+                "Tell the user there was a technical issue reaching your backend."
+            }
             
     async def receive(self, frame: Tuple[int, NDArray]) -> None:
         """Receive audio from the robot microphone."""
