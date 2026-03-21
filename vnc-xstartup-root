@@ -1,0 +1,14 @@
+#!/bin/sh
+# Minimal TigerVNC xstartup - use for /root/.vnc/xstartup when running vncserver as root
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+export XDG_SESSION_TYPE=x11
+
+# Start a simple session: lightweight WM if available, else just xterm
+if command -v startxfce4 >/dev/null 2>&1; then
+  exec startxfce4
+elif command -v openbox >/dev/null 2>&1; then
+  exec openbox-session
+else
+  exec xterm
+fi

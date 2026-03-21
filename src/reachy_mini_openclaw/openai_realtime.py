@@ -172,7 +172,11 @@ OpenClaw has access to many capabilities you don't have directly.""",
         return tools
         
     async def start_up(self) -> None:
-        """Start the handler and connect to OpenAI."""
+        """Start the handler and connect to OpenAI.
+        
+        Runs an infinite reconnection loop so the robot stays alive
+        even if the WebSocket drops (network blip, idle timeout, etc.).
+        """
         api_key = config.OPENAI_API_KEY
         if not api_key:
             logger.error("OPENAI_API_KEY not configured")
@@ -182,26 +186,36 @@ OpenClaw has access to many capabilities you don't have directly.""",
         self.start_time = asyncio.get_event_loop().time()
         self.last_activity_time = self.start_time
         
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        attempt = 0
+        max_backoff = 30  # Cap backoff at 30 seconds
+        
+        while not self._shutdown_requested:
+            attempt += 1
             try:
                 await self._run_session()
-                return
+                # Session ended cleanly (shouldn't normally happen)
+                if self._shutdown_requested:
+                    return
+                # Reset attempt counter on a clean exit
+                attempt = 0
             except ConnectionClosedError as e:
-                logger.warning("WebSocket closed unexpectedly (attempt %d/%d): %s", 
-                             attempt, max_attempts, e)
-                if attempt < max_attempts:
-                    delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-                    logger.info("Retrying in %.1f seconds...", delay)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
+                logger.warning("WebSocket closed unexpectedly (attempt %d): %s", attempt, e)
+            except Exception as e:
+                logger.error("Session error (attempt %d): %s", attempt, e)
             finally:
                 self.connection = None
                 try:
                     self._connected_event.clear()
                 except Exception:
                     pass
+            
+            if self._shutdown_requested:
+                return
+                
+            # Exponential backoff with jitter, capped at max_backoff
+            delay = min(max_backoff, (2 ** min(attempt - 1, 5))) + random.uniform(0, 1)
+            logger.info("Reconnecting in %.1f seconds...", delay)
+            await asyncio.sleep(delay)
                     
     async def _run_session(self) -> None:
         """Run a single OpenAI Realtime session."""

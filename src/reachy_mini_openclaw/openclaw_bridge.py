@@ -135,8 +135,12 @@ class OpenClawBridge:
             "set" if self.gateway_token else "not set",
         )
         try:
+            # Build origin header from the gateway URL so the control-UI
+            # origin check accepts programmatic WebSocket clients.
+            origin = self.gateway_url.replace("ws://", "http://").replace("wss://", "https://")
             self._ws = await websockets.connect(
                 self.gateway_url,
+                origin=origin,
                 ping_interval=20,
                 ping_timeout=30,
                 close_timeout=5,
