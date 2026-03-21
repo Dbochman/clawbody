@@ -163,7 +163,7 @@ class OpenClawBridge:
                     "maxProtocol": PROTOCOL_VERSION,
                     "auth": {"token": self.gateway_token} if self.gateway_token else {},
                     "client": {
-                        "id": "webchat",
+                        "id": "openclaw-control-ui",
                         "version": "1.0.0",
                         "platform": "linux",
                         "mode": "webchat",

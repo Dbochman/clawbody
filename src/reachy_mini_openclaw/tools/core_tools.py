@@ -24,6 +24,67 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+async def _analyze_image_with_openai(frame: np.ndarray, prompt: str) -> Optional[str]:
+    """Analyze an image using OpenAI's Chat Completions API (gpt-4o-mini).
+
+    This provides reliable cloud-based vision analysis using the same
+    OPENAI_API_KEY already configured for the Realtime API.
+
+    Args:
+        frame: BGR numpy array from the camera
+        prompt: The question/prompt to ask about the image
+
+    Returns:
+        Description string, or None if the call fails
+    """
+    try:
+        import cv2
+        from openai import AsyncOpenAI
+        from reachy_mini_openclaw.config import config
+
+        api_key = config.OPENAI_API_KEY
+        if not api_key:
+            logger.warning("No OPENAI_API_KEY for vision analysis")
+            return None
+
+        # Encode frame as JPEG
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        b64_image = base64.b64encode(buffer).decode('utf-8')
+
+        client = AsyncOpenAI(api_key=api_key)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=300,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_image}",
+                                "detail": "low",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+
+        text = response.choices[0].message.content
+        if text:
+            return text.strip()
+        return None
+
+    except Exception as e:
+        logger.error("OpenAI vision analysis failed: %s", e)
+        return None
+
+
 @dataclass
 class ToolDependencies:
     """Dependencies required by tools.
@@ -214,7 +275,10 @@ async def _handle_look(args: dict, deps: ToolDependencies) -> dict:
 async def _handle_camera(args: dict, deps: ToolDependencies) -> dict:
     """Handle the camera tool - capture image and get description.
     
-    Uses local vision (SmolVLM2) if available, otherwise falls back to OpenClaw.
+    Priority order for vision analysis:
+    1. Local SmolVLM2 (on-device, no network latency)
+    2. OpenAI Vision API (gpt-4o-mini, reliable cloud vision)
+    3. OpenClaw bridge (text-only fallback)
     """
     logger.info("Camera tool called, camera_worker=%s, vision_manager=%s", 
                 deps.camera_worker is not None, deps.vision_manager is not None)
@@ -242,12 +306,16 @@ async def _handle_camera(args: dict, deps: ToolDependencies) -> dict:
         
         logger.info("Got frame, shape=%s", frame.shape)
         
+        vision_prompt = (
+            "Describe what you see in this image. Be specific about people, "
+            "objects, and the environment. Keep it concise (2-3 sentences). "
+            "Speak as if you are looking through your own eyes."
+        )
+        
         # Option 1: Use local vision processor (SmolVLM2) if available
         if deps.vision_manager is not None:
             logger.info("Using local vision processor (SmolVLM2)...")
-            description = deps.vision_manager.process_now(
-                "Describe what you see in this image. Be specific about people, objects, and the environment. Keep it concise (2-3 sentences)."
-            )
+            description = deps.vision_manager.process_now(vision_prompt)
             if description and not description.startswith(("Vision", "Failed", "Error", "GPU", "No camera")):
                 logger.info("Local vision response: %s", description[:100])
                 return {
@@ -258,15 +326,26 @@ async def _handle_camera(args: dict, deps: ToolDependencies) -> dict:
             else:
                 logger.warning("Local vision failed: %s", description)
         
-        # Option 2: Fall back to OpenClaw for vision analysis
+        # Option 2: Use OpenAI Vision API (gpt-4o-mini) for image analysis
+        logger.info("Using OpenAI Vision API (gpt-4o-mini) for image analysis...")
+        openai_description = await _analyze_image_with_openai(frame, vision_prompt)
+        if openai_description:
+            logger.info("OpenAI vision response: %s", openai_description[:100])
+            return {
+                "status": "success",
+                "description": openai_description,
+                "source": "openai_vision"
+            }
+        
+        # Option 3: Fall back to OpenClaw for vision analysis (text-only, limited)
         if deps.openclaw_bridge is not None and deps.openclaw_bridge.is_connected:
-            logger.info("Using OpenClaw for vision analysis...")
+            logger.info("Using OpenClaw for vision analysis (text-only fallback)...")
             import cv2
             _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             b64_image = base64.b64encode(buffer).decode('utf-8')
             
             response = await deps.openclaw_bridge.chat(
-                "Describe what you see in this image. Be specific about people, objects, and the environment. Keep it concise (2-3 sentences).",
+                vision_prompt,
                 image_b64=b64_image,
                 system_context="You are looking through your robot camera. Describe what you see naturally, as if you're the one looking.",
             )
@@ -280,7 +359,7 @@ async def _handle_camera(args: dict, deps: ToolDependencies) -> dict:
             else:
                 logger.warning("OpenClaw vision failed: %s", response.error)
         
-        # Fallback if neither is available
+        # Fallback if nothing worked
         return {
             "status": "partial",
             "description": "I captured an image but couldn't analyze it. No vision processing available."
