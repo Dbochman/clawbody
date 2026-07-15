@@ -25,9 +25,6 @@ class Config:
     OPENAI_VOICE: str = field(default_factory=lambda: os.getenv("OPENAI_VOICE", "cedar"))
     OPENAI_TTS_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_TTS_MODEL", "tts-1"))
     OPENAI_TTS_VOICE: str = field(default_factory=lambda: os.getenv("OPENAI_TTS_VOICE", "onyx"))
-    OPENAI_TTS_PREBUFFER_MS: int = field(
-        default_factory=lambda: int(os.getenv("OPENAI_TTS_PREBUFFER_MS", "1000"))
-    )
     OPENAI_TRANSCRIPTION_MODEL: str = field(
         default_factory=lambda: os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
     )
