@@ -398,6 +398,7 @@ class ClawBodyCore:
                         audio_data = resample(audio_data, num_samples).astype("float32")
                         
                     self.robot.media.push_audio_sample(audio_data)
+                    self.handler.note_audio_playback_started()
                 # else: it's an AdditionalOutputs (transcript) - handle in UI mode
                 
             await asyncio.sleep(0.01)

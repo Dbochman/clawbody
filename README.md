@@ -221,9 +221,18 @@ OPENAI_API_KEY=sk-...your-key...
 OPENCLAW_GATEWAY_URL=http://localhost:18789  # or your host IP
 OPENCLAW_TOKEN=your-gateway-token
 OPENCLAW_AGENT_ID=main
+OPENCLAW_THINKING_LEVEL=minimal
+OPENCLAW_FAST_MODE=true
 
-# Optional - Customize voice
+# Optional - Customize the streaming Speech API voice
 OPENAI_VOICE=cedar
+OPENAI_TTS_MODEL=tts-1
+OPENAI_TTS_VOICE=onyx
+
+# Optional - Tune transcription latency
+OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
+OPENAI_TRANSCRIPTION_LANGUAGE=en
+OPENAI_VAD_SILENCE_MS=400
 
 # Optional - Face tracking (enabled by default)
 ENABLE_FACE_TRACKING=true
