@@ -28,6 +28,8 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+from reachy_mini_openclaw.playback_audio import prepare_reachy_stereo
+
 # Load environment from project root (override=True ensures .env takes precedence)
 _project_root = Path(__file__).parent.parent.parent
 load_dotenv(_project_root / ".env", override=True)
@@ -384,20 +386,11 @@ class ClawBodyCore:
             if output is not None:
                 if isinstance(output, tuple):
                     input_sr, audio_data = output
-                    
-                    # Convert to float32 and normalize (OpenAI sends int16)
-                    audio_data = audio_data.flatten().astype("float32") / 32768.0
-                    
-                    # Reduce volume to prevent distortion (0.5 = 50% volume)
-                    audio_data = audio_data * 0.5
-                    
-                    # Resample if needed
-                    if input_sr != output_sr:
-                        from scipy.signal import resample
-                        num_samples = int(len(audio_data) * output_sr / input_sr)
-                        audio_data = resample(audio_data, num_samples).astype("float32")
-                        
-                    self.robot.media.push_audio_sample(audio_data)
+
+                    # Reachy's appsrc is F32LE stereo. Preserve the number of
+                    # frames when duplicating OpenAI's mono PCM into both channels.
+                    stereo_audio = prepare_reachy_stereo(audio_data, input_sr, output_sr)
+                    self.robot.media.push_audio_sample(stereo_audio)
                     self.handler.note_audio_playback_started()
                 # else: it's an AdditionalOutputs (transcript) - handle in UI mode
                 

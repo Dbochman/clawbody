@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 # OpenAI Realtime API audio format
 OPENAI_SAMPLE_RATE: Final[Literal[24000]] = 24000
 TTS_CHUNK_BYTES: Final[int] = 4800
+TTS_PREBUFFER_MS: Final[int] = config.OPENAI_TTS_PREBUFFER_MS
+TTS_PREBUFFER_BYTES: Final[int] = OPENAI_SAMPLE_RATE * 2 * TTS_PREBUFFER_MS // 1000
 
 
 class OpenAIRealtimeHandler(AsyncStreamHandler):
@@ -378,6 +380,8 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                 self._speaking = True
                 request_started = asyncio.get_event_loop().time()
                 first_chunk = True
+                playback_released = False
+                prebuffer = bytearray()
                 total_bytes = 0
                 trailing_byte = b""
                 async with self.client.audio.speech.with_streaming_response.create(
@@ -402,26 +406,44 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                                     "Latency first TTS byte: %.0fms",
                                     (asyncio.get_event_loop().time() - turn_started) * 1000,
                                 )
-                                if self._playback_marker_turn_started is None:
-                                    self._playback_marker_turn_started = turn_started
                             logger.info(
                                 "TTS time to first byte: %.0fms",
                                 (asyncio.get_event_loop().time() - request_started) * 1000,
                             )
-                            # Keep the thinking pose until playable audio exists.
-                            self.deps.movement_manager.set_processing(False)
 
                         total_bytes += len(chunk)
-                        self.suppress_input_for(len(chunk) / (2 * OPENAI_SAMPLE_RATE))
-                        if self.deps.head_wobbler is not None:
-                            self.deps.head_wobbler.feed(base64.b64encode(chunk).decode("ascii"))
-                        audio_data = np.frombuffer(chunk, dtype=np.int16).reshape(1, -1)
-                        await self.output_queue.put((OPENAI_SAMPLE_RATE, audio_data))
+                        if not playback_released:
+                            prebuffer.extend(chunk)
+                            if len(prebuffer) < TTS_PREBUFFER_BYTES:
+                                continue
+                            chunk = bytes(prebuffer)
+                            prebuffer.clear()
+                            playback_released = True
+                            logger.info(
+                                "TTS startup buffer ready: %.0fms PCM",
+                                len(chunk) / (2 * OPENAI_SAMPLE_RATE) * 1000,
+                            )
+                            if turn_started is not None and self._playback_marker_turn_started is None:
+                                self._playback_marker_turn_started = turn_started
+                            # Keep the thinking pose until buffered audio is playable.
+                            self.deps.movement_manager.set_processing(False)
+
+                        await self._queue_speech_pcm(chunk)
 
                 if first_chunk:
                     raise RuntimeError("OpenAI returned no speech audio")
                 if trailing_byte:
                     logger.debug("Discarding incomplete PCM sample from TTS stream")
+                if prebuffer:
+                    playback_released = True
+                    logger.info(
+                        "TTS short-clip buffer ready: %.0fms PCM",
+                        len(prebuffer) / (2 * OPENAI_SAMPLE_RATE) * 1000,
+                    )
+                    if turn_started is not None and self._playback_marker_turn_started is None:
+                        self._playback_marker_turn_started = turn_started
+                    self.deps.movement_manager.set_processing(False)
+                    await self._queue_speech_pcm(bytes(prebuffer))
 
                 duration_seconds = total_bytes / (2 * OPENAI_SAMPLE_RATE)
                 self.last_activity_time = asyncio.get_event_loop().time()
@@ -444,6 +466,14 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
             finally:
                 if not self._is_playing_speech():
                     self._speaking = False
+
+    async def _queue_speech_pcm(self, chunk: bytes) -> None:
+        """Queue one aligned mono PCM chunk for movement and speaker playback."""
+        self.suppress_input_for(len(chunk) / (2 * OPENAI_SAMPLE_RATE))
+        if self.deps.head_wobbler is not None:
+            self.deps.head_wobbler.feed(base64.b64encode(chunk).decode("ascii"))
+        audio_data = np.frombuffer(chunk, dtype=np.int16).reshape(1, -1)
+        await self.output_queue.put((OPENAI_SAMPLE_RATE, audio_data))
 
     async def receive(self, frame: tuple[int, NDArray]) -> None:
         """Receive audio from the robot microphone."""
