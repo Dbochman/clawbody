@@ -8,13 +8,10 @@ Tool Categories:
 2. Vision Tools - Capture and analyze camera images
 """
 
-import asyncio
 import json
 import logging
 import base64
-import threading
 from dataclasses import dataclass
-from collections.abc import Callable
 from typing import Any, Optional, TYPE_CHECKING
 
 import numpy as np
@@ -25,34 +22,6 @@ if TYPE_CHECKING:
     from reachy_mini_openclaw.openclaw_bridge import OpenClawBridge
 
 logger = logging.getLogger(__name__)
-
-RECORDED_DATASETS = {
-    "dance": "pollen-robotics/reachy-mini-dances-library",
-    "emotion": "pollen-robotics/reachy-mini-emotions-library",
-}
-BUILTIN_DANCES = {"happy", "excited", "wave", "nod", "shake", "bounce"}
-VOCAL_DANCE_PRESETS = {"dance1", "dance2", "dance3"}
-EMOTION_ALIASES = {
-    "happy": "cheerful1",
-    "sad": "sad1",
-    "surprised": "surprised1",
-    "curious": "curious1",
-    "thinking": "thoughtful1",
-    "confused": "confused1",
-    "excited": "enthusiastic1",
-}
-_recorded_libraries: dict[str, Any] = {}
-_recorded_libraries_lock = threading.Lock()
-
-
-def _get_recorded_library(kind: str) -> Any:
-    """Load one official preset library once, using the SDK's local HF cache."""
-    from reachy_mini.motion.recorded_move import RecordedMoves
-
-    with _recorded_libraries_lock:
-        if kind not in _recorded_libraries:
-            _recorded_libraries[kind] = RecordedMoves(RECORDED_DATASETS[kind])
-        return _recorded_libraries[kind]
 
 
 async def _analyze_image_with_openai(frame: np.ndarray, prompt: str) -> Optional[str]:
@@ -130,7 +99,6 @@ class ToolDependencies:
     openclaw_bridge: Optional["OpenClawBridge"] = None
     vision_manager: Optional[Any] = None  # Local vision processor (SmolVLM2)
     daemon_face_tracking: bool = False
-    suppress_input: Optional[Callable[[float], None]] = None
 
 
 # Tool specifications in OpenAI format
@@ -185,7 +153,8 @@ TOOL_SPECS = [
             "properties": {
                 "dance_name": {
                     "type": "string",
-                    "description": "Any installed official dance preset, dance1/dance2/dance3 for vocalized dances, or a built-in dance. Call presets when unsure."
+                    "enum": ["happy", "excited", "wave", "nod", "shake", "bounce"],
+                    "description": "The dance to perform"
                 }
             },
             "required": ["dance_name"]
@@ -200,20 +169,11 @@ TOOL_SPECS = [
             "properties": {
                 "emotion_name": {
                     "type": "string",
-                    "description": "Any installed official emotion preset or a friendly alias such as happy, sad, surprised, curious, thinking, confused, or excited. Call presets when unsure."
+                    "enum": ["happy", "sad", "surprised", "curious", "thinking", "confused", "excited"],
+                    "description": "The emotion to express"
                 }
             },
             "required": ["emotion_name"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "presets",
-        "description": "List every installed emotion and dance preset, including which presets have bundled vocalizations.",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "required": []
         }
     },
     {
@@ -274,7 +234,6 @@ async def dispatch_tool_call(
         "face_tracking": _handle_face_tracking,
         "dance": _handle_dance,
         "emotion": _handle_emotion,
-        "presets": _handle_presets,
         "stop_moves": _handle_stop_moves,
         "idle": _handle_idle,
     }
@@ -444,97 +403,61 @@ async def _handle_face_tracking(args: dict, deps: ToolDependencies) -> dict:
 
 
 async def _handle_dance(args: dict, deps: ToolDependencies) -> dict:
-    """Run a built-in dance or any official recorded dance preset."""
+    """Handle dance tool."""
     dance_name = args.get("dance_name", "happy")
-
+    
     try:
-        if deps.daemon_face_tracking:
-            deps.robot.start_head_tracking(weight=0.25)
-
-        if dance_name in BUILTIN_DANCES:
-            from reachy_mini_openclaw.moves import ExpressiveDanceMove
-
-            dance_move = ExpressiveDanceMove(dance_name)
-            backend = "builtin"
+        # Try to use dance library if available
+        from reachy_mini_dances_library import dances
+        
+        if hasattr(dances, dance_name):
+            dance_class = getattr(dances, dance_name)
+            dance_move = dance_class()
+            deps.movement_manager.queue_move(dance_move)
+            return {"status": "success", "dance": dance_name}
         else:
-            kind = "emotion" if dance_name in VOCAL_DANCE_PRESETS else "dance"
-            library = await asyncio.to_thread(_get_recorded_library, kind)
-            dance_move = library.get(dance_name)
-            backend = f"official-{kind}-preset"
-
-        sound_path = dance_move.sound_path
-        if sound_path is not None:
-            if deps.suppress_input is not None:
-                deps.suppress_input(dance_move.duration)
-            deps.robot.media.play_sound(str(sound_path))
-        deps.movement_manager.queue_move(dance_move)
-        await asyncio.sleep(dance_move.duration)
-        return {
-            "status": "success",
-            "dance": dance_name,
-            "backend": backend,
-            "duration_seconds": round(dance_move.duration, 2),
-            "vocalization": sound_path is not None,
-        }
+            # Fallback to simple head movement
+            return await _handle_emotion({"emotion_name": dance_name}, deps)
+    except ImportError:
+        # No dance library, use emotion as fallback
+        return await _handle_emotion({"emotion_name": dance_name}, deps)
     except Exception as e:
         return {"error": str(e)}
 
 
 async def _handle_emotion(args: dict, deps: ToolDependencies) -> dict:
-    """Play any official recorded emotion with its bundled vocalization."""
+    """Handle emotion expression."""
+    from reachy_mini_openclaw.moves import HeadLookMove
+    
     emotion_name = args.get("emotion_name", "happy")
-    preset_name = EMOTION_ALIASES.get(emotion_name, emotion_name)
-
+    
+    # Map emotions to simple head movements
+    emotion_sequences = {
+        "happy": ["up", "front"],
+        "sad": ["down"],
+        "surprised": ["up", "front"],
+        "curious": ["right", "left", "front"],
+        "thinking": ["up", "left"],
+        "confused": ["left", "right", "front"],
+        "excited": ["up", "down", "up", "front"],
+    }
+    
+    sequence = emotion_sequences.get(emotion_name, ["front"])
+    
     try:
-        if deps.daemon_face_tracking:
-            deps.robot.start_head_tracking(weight=0.25)
-        library = await asyncio.to_thread(_get_recorded_library, "emotion")
-        move = library.get(preset_name)
-        sound_path = move.sound_path
-        if sound_path is not None:
-            if deps.suppress_input is not None:
-                deps.suppress_input(move.duration)
-            deps.robot.media.play_sound(str(sound_path))
-        deps.movement_manager.queue_move(move)
-        await asyncio.sleep(move.duration)
-        return {
-            "status": "success",
-            "emotion": emotion_name,
-            "preset": preset_name,
-            "backend": "official-emotion-preset",
-            "duration_seconds": round(move.duration, 2),
-            "vocalization": sound_path is not None,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-async def _handle_presets(args: dict, deps: ToolDependencies) -> dict:
-    """Return the complete installed official preset catalog."""
-    try:
-        dance_library, emotion_library = await asyncio.gather(
-            asyncio.to_thread(_get_recorded_library, "dance"),
-            asyncio.to_thread(_get_recorded_library, "emotion"),
-        )
-        emotion_presets = set(emotion_library.list_moves())
-        vocalized_emotions = sorted(
-            name
-            for name in emotion_presets
-            if emotion_library.get(name).sound_path is not None
-        )
-        return {
-            "status": "success",
-            "dances": sorted(
-                BUILTIN_DANCES
-                | set(dance_library.list_moves())
-                | VOCAL_DANCE_PRESETS
-            ),
-            "emotions": sorted(emotion_presets | set(EMOTION_ALIASES)),
-            "vocalized_dances": sorted(VOCAL_DANCE_PRESETS),
-            "vocalized_emotions": vocalized_emotions,
-            "silent_emotions": sorted(emotion_presets - set(vocalized_emotions)),
-            "official_dances_are_motion_only": True,
-        }
+        for direction in sequence:
+            _, current_ant = deps.robot.get_current_joint_positions()
+            current_head = deps.robot.get_current_head_pose()
+            
+            move = HeadLookMove(
+                direction=direction,
+                start_pose=current_head,
+                start_antennas=tuple(current_ant),
+                duration=0.5,
+            )
+            deps.movement_manager.queue_move(move)
+        
+        return {"status": "success", "emotion": emotion_name}
     except Exception as e:
         return {"error": str(e)}
 

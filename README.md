@@ -35,7 +35,7 @@ tags:
 
 **Give your OpenClaw AI agent a physical robot body!**
 
-ClawBody combines OpenClaw's AI intelligence with Reachy Mini's expressive robot body, using OpenAI's Realtime API for ultra-responsive voice conversation. Your OpenClaw assistant (Clawson) can now see, hear, speak, and move in the physical world.
+ClawBody combines OpenClaw's skills and personality with Reachy Mini's expressive robot body. Ordinary conversation runs directly through OpenAI Realtime using a live SOUL/capsule snapshot; requests needing skills or external actions delegate to OpenClaw on demand.
 
 ![Reachy Mini Dance](https://huggingface.co/spaces/pollen-robotics/reachy_mini_conversation_app/resolve/main/docs/assets/reachy_mini_dance.gif)
 
@@ -94,7 +94,9 @@ clawbody --gradio
 
 - **👁️ Face Tracking**: Robot tracks your face and maintains eye contact during conversation
 - **🎤 Real-time Voice Conversation**: OpenAI Realtime API for sub-second response latency
-- **🧠 OpenClaw Intelligence**: Your responses come from OpenClaw with full tool access
+- **🧠 OpenClaw Skills on Demand**: Fast local voice turns delegate to the full OpenClaw agent whenever a request needs tools, memory, or external actions
+- **🔗 Private Continuity**: SOUL and compact expiring capsule summaries keep Reachy and OpenClaw aligned without copying raw room transcripts
+- **🎛️ Exclusive Control Lease**: OpenClaw can proactively see, speak, move, emote, or dance through Reachy without competing with the direct voice session
 - **👀 Vision**: See through the robot's camera and describe the environment
 - **💃 Expressive Movements**: Natural head movements, emotions, dances, and audio-driven wobble
 - **🦞 Clawson Embodied**: Your friendly space lobster AI assistant, now with a body!
@@ -103,43 +105,18 @@ clawbody --gradio
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Your Voice / Microphone                      │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              Reachy Mini Robot (or Simulator)                    │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │ Microphone  │  │   Camera    │  │   Movement System       │  │
-│  │  (input)    │  │  (vision)   │  │ (head, antennas, body)  │  │
-│  └──────┬──────┘  └──────┬──────┘  └────────────▲────────────┘  │
-└─────────┼────────────────┼──────────────────────┼───────────────┘
-          │                │                      │
-          ▼                ▼                      │
-┌─────────────────────────────────────────────────┼───────────────┐
-│                      ClawBody                   │               │
-│  ┌─────────────────────────────────────────────┼────────────┐  │
-│  │         OpenAI Realtime API Handler         │            │  │
-│  │  • Speech recognition (Whisper)             │            │  │
-│  │  • Text-to-speech (voices)                 ─┘            │  │
-│  │  • Audio analysis → head wobble                          │  │
-│  └─────────────────────────────────────────────────────────┘  │
-│                           │                                     │
-│                           ▼                                     │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │              OpenClaw Gateway Bridge                     │  │
-│  │  • AI responses from Clawson                            │  │
-│  │  • Full OpenClaw tool access                            │  │
-│  │  • Conversation memory & context                        │  │
-│  └─────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    OpenClaw Gateway                              │
-│  • Web browsing  • Calendar  • Smart home  • Memory  • Tools    │
-└─────────────────────────────────────────────────────────────────┘
+Voice → Reachy mic → persistent OpenAI Realtime session → Reachy speaker
+                         │                         │
+                         │ local robot tools       └─ look / emotion / dance
+                         │
+                         ├─ SOUL + capsule RPC (no agent/model turn)
+                         │
+                         └─ ask_openclaw, only when needed
+                                      │
+                                      ▼
+                           OpenClaw skills and memory
+
+OpenClaw proactive action → exclusive control lease → camera / motion / speech
 ```
 
 ## 📋 Prerequisites
@@ -217,13 +194,16 @@ cp .env.example .env
 # Required
 OPENAI_API_KEY=sk-...your-key...
 
-# OpenClaw Gateway (required for AI responses)
+# OpenClaw Gateway (capsule/control RPC and delegated skill requests)
 OPENCLAW_GATEWAY_URL=http://localhost:18789  # or your host IP
 OPENCLAW_TOKEN=your-gateway-token
 OPENCLAW_AGENT_ID=main
 
-# Optional - Customize voice
+# Native direct voice fast path (set openclaw for compatibility fallback)
+REACHY_VOICE_MODE=direct
+OPENAI_MODEL=gpt-realtime-2.1-mini
 OPENAI_VOICE=cedar
+OPENAI_AUDIO_JITTER_MS=220
 
 # Optional - Face tracking (enabled by default)
 ENABLE_FACE_TRACKING=true

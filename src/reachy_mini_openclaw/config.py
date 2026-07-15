@@ -21,8 +21,31 @@ class Config:
     
     # OpenAI Configuration
     OPENAI_API_KEY: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    OPENAI_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-realtime-1.5"))
+    OPENAI_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-realtime-2.1-mini"))
     OPENAI_VOICE: str = field(default_factory=lambda: os.getenv("OPENAI_VOICE", "cedar"))
+    OPENAI_TTS_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_TTS_MODEL", "tts-1"))
+    OPENAI_TTS_VOICE: str = field(default_factory=lambda: os.getenv("OPENAI_TTS_VOICE", "onyx"))
+    OPENAI_TRANSCRIPTION_MODEL: str = field(
+        default_factory=lambda: os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
+    )
+    OPENAI_TRANSCRIPTION_LANGUAGE: str = field(
+        default_factory=lambda: os.getenv("OPENAI_TRANSCRIPTION_LANGUAGE", "en")
+    )
+    OPENAI_VAD_SILENCE_MS: int = field(
+        default_factory=lambda: int(os.getenv("OPENAI_VAD_SILENCE_MS", "400"))
+    )
+    OPENAI_AUDIO_JITTER_MS: int = field(
+        default_factory=lambda: int(os.getenv("OPENAI_AUDIO_JITTER_MS", "220"))
+    )
+    REACHY_VOICE_MODE: str = field(
+        default_factory=lambda: os.getenv("REACHY_VOICE_MODE", "direct").lower()
+    )
+    CONTINUITY_REFRESH_SECONDS: float = field(
+        default_factory=lambda: float(os.getenv("CONTINUITY_REFRESH_SECONDS", "2"))
+    )
+    CONTINUITY_SUMMARY_MODEL: str = field(
+        default_factory=lambda: os.getenv("CONTINUITY_SUMMARY_MODEL", "gpt-5.4-mini")
+    )
     
     # OpenClaw Gateway Configuration
     OPENCLAW_GATEWAY_URL: str = field(default_factory=lambda: os.getenv("OPENCLAW_GATEWAY_URL", "ws://localhost:18789"))
@@ -31,6 +54,15 @@ class Config:
     # Session key for OpenClaw - uses "main" to share context with WhatsApp and other channels
     # Format: agent:<agent_id>:<session_key>, but we only need the session key part here
     OPENCLAW_SESSION_KEY: str = field(default_factory=lambda: os.getenv("OPENCLAW_SESSION_KEY", "main"))
+    OPENCLAW_THINKING_LEVEL: str = field(
+        default_factory=lambda: os.getenv("OPENCLAW_THINKING_LEVEL", "minimal")
+    )
+    OPENCLAW_FAST_MODE: bool = field(
+        default_factory=lambda: os.getenv("OPENCLAW_FAST_MODE", "true").lower() == "true"
+    )
+    OPENCLAW_STREAM_SETTLE_MS: int = field(
+        default_factory=lambda: int(os.getenv("OPENCLAW_STREAM_SETTLE_MS", "350"))
+    )
     
     # Robot Configuration
     ROBOT_NAME: Optional[str] = field(default_factory=lambda: os.getenv("ROBOT_NAME"))
@@ -41,7 +73,7 @@ class Config:
     ENABLE_FACE_TRACKING: bool = field(default_factory=lambda: os.getenv("ENABLE_FACE_TRACKING", "true").lower() == "true")
     
     # Face Tracking Configuration
-    # Options: "yolo", "mediapipe", or None for auto-detect
+    # Options: "daemon" (Reachy Wireless 1.9+), "yolo", or "mediapipe"
     HEAD_TRACKER_TYPE: Optional[str] = field(default_factory=lambda: os.getenv("HEAD_TRACKER_TYPE", "yolo"))
     
     # Local Vision Processing
@@ -58,6 +90,8 @@ class Config:
         errors = []
         if not self.OPENAI_API_KEY:
             errors.append("OPENAI_API_KEY is required")
+        if self.REACHY_VOICE_MODE not in {"direct", "openclaw"}:
+            errors.append("REACHY_VOICE_MODE must be 'direct' or 'openclaw'")
         return errors
 
 

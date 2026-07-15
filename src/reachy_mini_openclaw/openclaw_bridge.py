@@ -7,11 +7,11 @@ ClawBody uses OpenAI Realtime API for voice I/O (speech recognition + TTS)
 but routes all responses through OpenClaw (Clawson) for intelligence.
 """
 
-import json
 import asyncio
+import json
 import logging
 import uuid
-from typing import Optional, Any, AsyncIterator
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import websockets
@@ -21,14 +21,23 @@ from reachy_mini_openclaw.config import config
 logger = logging.getLogger(__name__)
 
 # Protocol version supported by this client
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 
 @dataclass
 class OpenClawResponse:
     """Response from OpenClaw gateway."""
+
     content: str
-    error: Optional[str] = None
+    error: str | None = None
+
+
+class OpenClawStreamError(RuntimeError):
+    """Raised when a streamed OpenClaw turn cannot complete."""
+
+
+class OpenClawContinuityError(RuntimeError):
+    """Raised when the trusted continuity RPC surface is unavailable."""
 
 
 class OpenClawBridge:
@@ -49,9 +58,9 @@ class OpenClawBridge:
 
     def __init__(
         self,
-        gateway_url: Optional[str] = None,
-        gateway_token: Optional[str] = None,
-        agent_id: Optional[str] = None,
+        gateway_url: str | None = None,
+        gateway_token: str | None = None,
+        agent_id: str | None = None,
         timeout: float = 300.0,
     ):
         """Initialize the OpenClaw bridge.
@@ -65,41 +74,25 @@ class OpenClawBridge:
         """
         import os
 
-        raw_url = (
-            gateway_url
-            or os.getenv("OPENCLAW_GATEWAY_URL")
-            or config.OPENCLAW_GATEWAY_URL
-        )
+        raw_url = gateway_url or os.getenv("OPENCLAW_GATEWAY_URL") or config.OPENCLAW_GATEWAY_URL
         # Normalise to ws:// (the gateway listens on the same port for both)
         self.gateway_url = self._normalise_ws_url(raw_url)
 
-        self.gateway_token = (
-            gateway_token
-            or os.getenv("OPENCLAW_TOKEN")
-            or config.OPENCLAW_TOKEN
-        )
-        self.agent_id = (
-            agent_id
-            or os.getenv("OPENCLAW_AGENT_ID")
-            or config.OPENCLAW_AGENT_ID
-        )
+        self.gateway_token = gateway_token or os.getenv("OPENCLAW_TOKEN") or config.OPENCLAW_TOKEN
+        self.agent_id = agent_id or os.getenv("OPENCLAW_AGENT_ID") or config.OPENCLAW_AGENT_ID
         self.timeout = timeout
 
         # Session key – "main" shares context with WhatsApp and other channels.
         # Full key format: agent:<agent_id>:<session_key>
-        self.session_key = (
-            os.getenv("OPENCLAW_SESSION_KEY")
-            or config.OPENCLAW_SESSION_KEY
-            or "main"
-        )
+        self.session_key = os.getenv("OPENCLAW_SESSION_KEY") or config.OPENCLAW_SESSION_KEY or "main"
 
         # Persistent WebSocket state
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._ws: websockets.WebSocketClientProtocol | None = None
         self._connected = False
-        self._conn_id: Optional[str] = None
+        self._conn_id: str | None = None
 
         # Background listener task & pending request futures
-        self._listener_task: Optional[asyncio.Task] = None
+        self._listener_task: asyncio.Task | None = None
         self._pending: dict[str, asyncio.Future] = {}
         # Events keyed by runId -> list of event payloads
         self._run_events: dict[str, asyncio.Queue] = {}
@@ -135,12 +128,8 @@ class OpenClawBridge:
             "set" if self.gateway_token else "not set",
         )
         try:
-            # Build origin header from the gateway URL so the control-UI
-            # origin check accepts programmatic WebSocket clients.
-            origin = self.gateway_url.replace("ws://", "http://").replace("wss://", "https://")
             self._ws = await websockets.connect(
                 self.gateway_url,
-                origin=origin,
                 ping_interval=20,
                 ping_timeout=30,
                 close_timeout=5,
@@ -163,13 +152,13 @@ class OpenClawBridge:
                     "maxProtocol": PROTOCOL_VERSION,
                     "auth": {"token": self.gateway_token} if self.gateway_token else {},
                     "client": {
-                        "id": "openclaw-control-ui",
+                        "id": "gateway-client",
                         "version": "1.0.0",
                         "platform": "linux",
-                        "mode": "webchat",
+                        "mode": "backend",
                     },
                     "role": "operator",
-                    "scopes": ["chat", "operator.write", "operator.read"],
+                    "scopes": ["operator.write", "operator.read"],
                 },
             }
             await self._ws.send(json.dumps(connect_req))
@@ -189,9 +178,7 @@ class OpenClawBridge:
                     self._conn_id,
                 )
                 # Start background listener
-                self._listener_task = asyncio.create_task(
-                    self._listen_loop(), name="openclaw-ws-listener"
-                )
+                self._listener_task = asyncio.create_task(self._listen_loop(), name="openclaw-ws-listener")
                 return True
             else:
                 err = hello.get("error", {})
@@ -284,9 +271,7 @@ class OpenClawBridge:
     # Request helpers
     # ------------------------------------------------------------------
 
-    async def _send_request(
-        self, method: str, params: dict, timeout: Optional[float] = None
-    ) -> dict:
+    async def _send_request(self, method: str, params: dict, timeout: float | None = None) -> dict:
         """Send a request and wait for the response.
 
         Args:
@@ -310,7 +295,7 @@ class OpenClawBridge:
             await self._ws.send(json.dumps(req))
             result = await asyncio.wait_for(fut, timeout=timeout or self.timeout)
             return result
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(req_id, None)
             return {"ok": False, "error": {"code": "TIMEOUT", "message": "Request timed out"}}
         except Exception as e:
@@ -321,6 +306,38 @@ class OpenClawBridge:
         """Build the full session key: agent:<agentId>:<sessionKey>."""
         return f"agent:{self.agent_id}:{self.session_key}"
 
+    async def get_reachy_continuity_context(self) -> dict:
+        """Fetch SOUL plus the expiring capsule without running an agent turn."""
+        response = await self._send_request(
+            "reachy.continuity.context",
+            {},
+            timeout=5,
+        )
+        if not response.get("ok"):
+            error = response.get("error", {})
+            raise OpenClawContinuityError(
+                error.get("message", "Reachy continuity context is unavailable")
+            )
+        payload = response.get("payload")
+        if not isinstance(payload, dict):
+            raise OpenClawContinuityError("Reachy continuity returned an invalid payload")
+        if not all(isinstance(payload.get(key), str) for key in ("revision", "soul", "capsule")):
+            raise OpenClawContinuityError("Reachy continuity payload is incomplete")
+        return payload
+
+    async def append_reachy_continuity_summary(self, summary: str, turn_id: str) -> None:
+        """Append one semantic direct-voice summary without invoking OpenClaw's agent."""
+        response = await self._send_request(
+            "reachy.continuity.append",
+            {"summary": summary, "turnId": turn_id},
+            timeout=5,
+        )
+        if not response.get("ok"):
+            error = response.get("error", {})
+            raise OpenClawContinuityError(
+                error.get("message", "Reachy continuity summary was rejected")
+            )
+
     # ------------------------------------------------------------------
     # Chat API
     # ------------------------------------------------------------------
@@ -328,8 +345,8 @@ class OpenClawBridge:
     async def chat(
         self,
         message: str,
-        image_b64: Optional[str] = None,
-        system_context: Optional[str] = None,
+        image_b64: str | None = None,
+        system_context: str | None = None,
     ) -> OpenClawResponse:
         """Send a message to OpenClaw and get a response.
 
@@ -368,6 +385,8 @@ class OpenClawBridge:
             "idempotencyKey": idempotency_key,
             "sessionKey": session_key,
             "message": final_message,
+            "thinking": config.OPENCLAW_THINKING_LEVEL,
+            "fastMode": config.OPENCLAW_FAST_MODE,
         }
 
         try:
@@ -393,9 +412,7 @@ class OpenClawBridge:
                 full_text = ""
                 while True:
                     try:
-                        event = await asyncio.wait_for(
-                            event_queue.get(), timeout=self.timeout
-                        )
+                        event = await asyncio.wait_for(event_queue.get(), timeout=self.timeout)
                         payload = event.get("payload", {})
                         event_name = event.get("event", "")
 
@@ -425,7 +442,7 @@ class OpenClawBridge:
                                     full_text = content_parts
                                 break
 
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         logger.warning("Timeout waiting for chat response (runId=%s)", run_id)
                         if full_text:
                             break
@@ -443,29 +460,34 @@ class OpenClawBridge:
     async def stream_chat(
         self,
         message: str,
-        image_b64: Optional[str] = None,
+        image_b64: str | None = None,
+        system_context: str | None = None,
     ) -> AsyncIterator[str]:
         """Stream a response from OpenClaw.
 
         Args:
             message: The user's message
             image_b64: Optional base64-encoded image
+            system_context: Optional additional system context
 
         Yields:
             String chunks of the response as they arrive
         """
         if not self._connected:
-            yield "[Error: Not connected to OpenClaw]"
-            return
+            raise OpenClawStreamError("Not connected to OpenClaw")
 
         final_message = message
+        if system_context:
+            final_message = f"[System: {system_context}]\n\n{message}"
         if image_b64:
-            final_message = f"[Image attached]\n{message}"
+            final_message = f"[Image attached]\n{final_message}"
 
         params = {
             "idempotencyKey": str(uuid.uuid4()),
             "sessionKey": self._full_session_key(),
             "message": final_message,
+            "thinking": config.OPENCLAW_THINKING_LEVEL,
+            "fastMode": config.OPENCLAW_FAST_MODE,
         }
 
         try:
@@ -473,13 +495,11 @@ class OpenClawBridge:
 
             if not resp.get("ok"):
                 err = resp.get("error", {})
-                yield f"[Error: {err.get('message', 'Unknown error')}]"
-                return
+                raise OpenClawStreamError(err.get("message", "Unknown error"))
 
             run_id = resp.get("payload", {}).get("runId")
             if not run_id:
-                yield "[Error: No runId]"
-                return
+                raise OpenClawStreamError("No runId in response")
 
             event_queue: asyncio.Queue = asyncio.Queue()
             self._run_events[run_id] = event_queue
@@ -489,7 +509,12 @@ class OpenClawBridge:
                 while True:
                     try:
                         event = await asyncio.wait_for(
-                            event_queue.get(), timeout=self.timeout
+                            event_queue.get(),
+                            timeout=(
+                                max(50, config.OPENCLAW_STREAM_SETTLE_MS) / 1000
+                                if prev_text
+                                else self.timeout
+                            ),
                         )
                         payload = event.get("payload", {})
                         event_name = event.get("event", "")
@@ -499,7 +524,23 @@ class OpenClawBridge:
                             data = payload.get("data", {})
 
                             if stream == "assistant":
+                                text = data.get("text")
                                 delta = data.get("delta", "")
+                                if isinstance(text, str):
+                                    if text.startswith(prev_text):
+                                        delta = text[len(prev_text) :]
+                                        prev_text = text
+                                    elif text != prev_text:
+                                        logger.warning(
+                                            "OpenClaw replaced streamed assistant text; keeping already-spoken prefix"
+                                        )
+                                        if not prev_text:
+                                            delta = text
+                                            prev_text = text
+                                        else:
+                                            delta = ""
+                                elif delta:
+                                    prev_text += delta
                                 if delta:
                                     yield delta
 
@@ -507,24 +548,54 @@ class OpenClawBridge:
                                 break
 
                         elif event_name == "chat" and payload.get("state") == "final":
+                            message_payload = payload.get("message", {})
+                            content = message_payload.get("content", [])
+                            final_text = ""
+                            if isinstance(content, str):
+                                final_text = content
+                            elif isinstance(content, list):
+                                final_text = "".join(
+                                    part.get("text", "")
+                                    for part in content
+                                    if isinstance(part, dict) and part.get("type") == "text"
+                                )
+                            if final_text.startswith(prev_text):
+                                delta = final_text[len(prev_text) :]
+                                if delta:
+                                    prev_text = final_text
+                                    yield delta
+                            elif final_text and not prev_text:
+                                prev_text = final_text
+                                yield final_text
+                            elif final_text != prev_text:
+                                logger.warning(
+                                    "OpenClaw final text differs from streamed prefix; not replaying revised text"
+                                )
                             break
 
-                    except asyncio.TimeoutError:
-                        yield "[Error: timeout]"
-                        break
+                    except TimeoutError:
+                        if prev_text:
+                            logger.warning(
+                                "No completion event after streamed assistant text; "
+                                "treating the received text as complete"
+                            )
+                            break
+                        raise OpenClawStreamError("Response timeout")
             finally:
                 self._run_events.pop(run_id, None)
 
+        except OpenClawStreamError:
+            raise
         except Exception as e:
             logger.error("OpenClaw streaming error: %s", e)
-            yield f"[Error: {e}]"
+            raise OpenClawStreamError(str(e)) from e
 
     @property
     def is_connected(self) -> bool:
         """Check if bridge is connected to gateway."""
         return self._connected
 
-    async def get_agent_context(self) -> Optional[str]:
+    async def get_agent_context(self) -> str | None:
         """Fetch the agent's current context, personality, and memory summary.
 
         This asks OpenClaw to provide a summary of:
@@ -570,9 +641,7 @@ class OpenClawBridge:
             logger.error("Failed to get agent context: %s", e)
             return None
 
-    async def sync_conversation(
-        self, user_message: str, assistant_response: str
-    ) -> None:
+    async def sync_conversation(self, user_message: str, assistant_response: str) -> None:
         """Sync a conversation turn back to OpenClaw for memory continuity.
 
         Args:
@@ -599,7 +668,7 @@ class OpenClawBridge:
 
 
 # Global bridge instance (lazy initialization)
-_bridge: Optional[OpenClawBridge] = None
+_bridge: OpenClawBridge | None = None
 
 
 def get_bridge() -> OpenClawBridge:
