@@ -474,7 +474,11 @@ class OpenClawBridge:
                     try:
                         event = await asyncio.wait_for(
                             event_queue.get(),
-                            timeout=2.0 if prev_text else self.timeout,
+                            timeout=(
+                                max(50, config.OPENCLAW_STREAM_SETTLE_MS) / 1000
+                                if prev_text
+                                else self.timeout
+                            ),
                         )
                         payload = event.get("payload", {})
                         event_name = event.get("event", "")

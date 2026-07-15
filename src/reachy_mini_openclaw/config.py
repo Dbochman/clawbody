@@ -48,6 +48,9 @@ class Config:
     OPENCLAW_FAST_MODE: bool = field(
         default_factory=lambda: os.getenv("OPENCLAW_FAST_MODE", "true").lower() == "true"
     )
+    OPENCLAW_STREAM_SETTLE_MS: int = field(
+        default_factory=lambda: int(os.getenv("OPENCLAW_STREAM_SETTLE_MS", "350"))
+    )
     
     # Robot Configuration
     ROBOT_NAME: Optional[str] = field(default_factory=lambda: os.getenv("ROBOT_NAME"))
