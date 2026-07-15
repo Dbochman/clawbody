@@ -11,6 +11,7 @@ import json
 import logging
 import random
 import uuid
+from pathlib import Path
 from typing import Any, Final, Literal
 
 import numpy as np
@@ -27,6 +28,7 @@ from reachy_mini_openclaw.tools.core_tools import (
     dispatch_tool_call,
     get_tool_specs,
 )
+from reachy_mini_openclaw.wake_word import WAKE_SAMPLE_RATE, WakeWordGate
 
 logger = logging.getLogger(__name__)
 
@@ -181,9 +183,22 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._response_active = False
         self._discard_response_audio = False
 
+        self._wake_word_gate: WakeWordGate | None = None
+        if config.REACHY_WAKE_WORD_ENABLED and self.direct_voice:
+            self._wake_word_gate = WakeWordGate(
+                Path(config.REACHY_WAKE_WORD_MODEL).expanduser(),
+                threshold=config.REACHY_WAKE_WORD_THRESHOLD,
+                initial_timeout_seconds=config.REACHY_WAKE_WORD_INITIAL_TIMEOUT_SECONDS,
+                followup_timeout_seconds=config.REACHY_WAKE_WORD_FOLLOWUP_TIMEOUT_SECONDS,
+            )
+
     @property
     def direct_voice(self) -> bool:
         return config.REACHY_VOICE_MODE == "direct"
+
+    @property
+    def wake_word_state(self) -> str:
+        return self._wake_word_gate.state if self._wake_word_gate is not None else "disabled"
 
     def copy(self) -> "OpenAIRealtimeHandler":
         return OpenAIRealtimeHandler(self.deps, self.openclaw_bridge, self.gradio_mode)
@@ -219,6 +234,17 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
     async def start_up(self) -> None:
         if not config.OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY required")
+
+        if self._wake_word_gate is not None:
+            await asyncio.to_thread(self._wake_word_gate.load)
+            self._wake_word_gate.sleep()
+            logger.info(
+                "Local wake-word gate armed: phrase=Hey Claude threshold=%.2f "
+                "initial_timeout=%.1fs followup_timeout=%.1fs",
+                config.REACHY_WAKE_WORD_THRESHOLD,
+                config.REACHY_WAKE_WORD_INITIAL_TIMEOUT_SECONDS,
+                config.REACHY_WAKE_WORD_FOLLOWUP_TIMEOUT_SECONDS,
+            )
 
         self.client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
         self.start_time = asyncio.get_event_loop().time()
@@ -406,6 +432,8 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
             return
 
         if event_type == "input_audio_buffer.speech_started":
+            if self._wake_word_gate is not None:
+                self._wake_word_gate.mark_speech_started()
             if config.REACHY_BARGE_IN and self._is_audio_playing():
                 await self._interrupt_playback()
             self._turn_delegated = False
@@ -420,6 +448,8 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
             logger.info("User started speaking")
 
         elif event_type == "input_audio_buffer.speech_stopped":
+            if self._wake_word_gate is not None:
+                self._wake_word_gate.mark_speech_stopped()
             self.deps.movement_manager.set_listening(False)
             self._set_speech_tracking(False)
             self._last_speech_stopped_at = asyncio.get_event_loop().time()
@@ -458,6 +488,8 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                         logger.debug("Could not delete transcribed Realtime item: %s", exc)
 
         elif event_type == "response.created" and self.direct_voice:
+            if self._wake_word_gate is not None:
+                self._wake_word_gate.mark_response_started()
             self._speaking = True
             self._response_active = True
             self._discard_response_audio = False
@@ -510,8 +542,12 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
             self._schedule_continuity_summary()
+            if self._wake_word_gate is not None:
+                self._wake_word_gate.mark_response_done()
 
         elif event_type == "error":
+            if self._wake_word_gate is not None:
+                self._wake_word_gate.mark_response_done()
             error = getattr(event, "error", None)
             logger.error(
                 "OpenAI error [%s]: %s",
@@ -932,6 +968,28 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
             audio = audio.astype(np.float32) / 32768.0
         elif audio.dtype != np.float32:
             audio = audio.astype(np.float32)
+
+        if self._wake_word_gate is not None:
+            if self._is_playing_speech() and self._wake_word_gate.state == "sleeping":
+                return
+            wake_audio = audio
+            if input_sr != WAKE_SAMPLE_RATE:
+                wake_count = int(len(wake_audio) * WAKE_SAMPLE_RATE / input_sr)
+                wake_audio = resample(wake_audio, wake_count).astype(np.float32)
+            wake_pcm = np.clip(wake_audio * 32767, -32768, 32767).astype(np.int16)
+            decision = self._wake_word_gate.process(wake_pcm)
+            if decision.timed_out:
+                self.deps.movement_manager.set_listening(False)
+                self._set_speech_tracking(False)
+                logger.info("Wake-word command/follow-up window closed")
+            if decision.activated:
+                self.deps.movement_manager.set_processing(False)
+                self.deps.movement_manager.set_listening(True)
+                self._set_speech_tracking(True)
+                logger.info("Wake word detected: Hey Claude")
+            if not decision.forward:
+                return
+
         if input_sr != OPENAI_SAMPLE_RATE:
             sample_count = int(len(audio) * OPENAI_SAMPLE_RATE / input_sr)
             audio = resample(audio, sample_count).astype(np.float32)

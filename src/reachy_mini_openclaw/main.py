@@ -275,6 +275,10 @@ class ClawBodyCore:
             self.handler.release_openclaw_control,
             self.handler.control_owner,
         )
+        if config.REACHY_WAKE_WORD_ENABLED:
+            self.control_server.set_wake_status_callback(
+                lambda: self.handler.wake_word_state
+            )
         
         # State
         self._stop_event = asyncio.Event()

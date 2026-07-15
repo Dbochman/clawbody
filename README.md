@@ -205,10 +205,31 @@ OPENAI_MODEL=gpt-realtime-2.1-mini
 OPENAI_VOICE=cedar
 OPENAI_AUDIO_JITTER_MS=220
 
+# Optional local wake-word gate (install with `pip install -e ".[wake_word]"`)
+REACHY_WAKE_WORD_ENABLED=true
+REACHY_WAKE_WORD_THRESHOLD=0.5
+REACHY_WAKE_WORD_INITIAL_TIMEOUT_SECONDS=10
+REACHY_WAKE_WORD_FOLLOWUP_TIMEOUT_SECONDS=20
+
 # Optional - Face tracking (enabled by default)
 ENABLE_FACE_TRACKING=true
 HEAD_TRACKER_TYPE=mediapipe  # or "yolo" for more accuracy
 ```
+
+### Local “Hey Claude” wake word
+
+When `REACHY_WAKE_WORD_ENABLED=true`, ClawBody runs the bundled “Hey Claude”
+openWakeWord model on Reachy. While sleeping, microphone frames stay on the
+robot and are not forwarded to OpenAI. Detection opens a ten-second window in
+which to begin speaking; once speech begins, the utterance can continue for any
+length supported by the normal Realtime turn detector. After a reply, Reachy
+remains engaged for 20 seconds so follow-ups and barge-in do not require another
+wake phrase.
+
+The face tracker and listening pose activate immediately when the wake phrase is
+detected. `reachyctl status` reports `wake_word_state` as `sleeping`, `waiting`,
+or `engaged`. Raise `REACHY_WAKE_WORD_THRESHOLD` to reduce false activations, or
+lower it if intended wakes are missed.
 
 ## 🎮 Usage
 

@@ -1,18 +1,22 @@
 import asyncio
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import numpy as np
+
 from reachy_mini_openclaw.control_server import ClawBodyControlServer
-from reachy_mini_openclaw.openclaw_bridge import (
-    OpenClawBridge,
-    OpenClawContinuityError,
-)
 from reachy_mini_openclaw.openai_realtime import (
     OpenAIRealtimeHandler,
     build_direct_voice_instructions,
     build_turn_detection,
 )
+from reachy_mini_openclaw.openclaw_bridge import (
+    OpenClawBridge,
+    OpenClawContinuityError,
+)
+from reachy_mini_openclaw.wake_word import WAKE_FRAME_SAMPLES, WakeWordGate
 
 
 class GatewayEventBufferTests(unittest.IsolatedAsyncioTestCase):
@@ -165,6 +169,118 @@ class RealtimeVadTests(unittest.TestCase):
 
         self.assertFalse(settings["create_response"])
         self.assertFalse(settings["interrupt_response"])
+
+
+class _FakeWakeModel:
+    def __init__(self, scores: list[float]) -> None:
+        self.scores = scores
+        self.reset_calls = 0
+
+    def predict(self, _frame) -> dict[str, float]:
+        return {"hey_claude": self.scores.pop(0) if self.scores else 0.0}
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+
+class WakeWordGateTests(unittest.TestCase):
+    def _gate(self, scores: list[float]):
+        now = [100.0]
+        model = _FakeWakeModel(scores)
+        gate = WakeWordGate(
+            Path(__file__),
+            threshold=0.5,
+            initial_timeout_seconds=10,
+            followup_timeout_seconds=20,
+            clock=lambda: now[0],
+            model_factory=lambda _path: model,
+        )
+        gate.load()
+        return gate, model, now
+
+    def test_sleeping_audio_stays_local_until_hey_claude_fires(self) -> None:
+        gate, model, _now = self._gate([0.1, 0.9])
+        frame = np.zeros(WAKE_FRAME_SAMPLES, dtype=np.int16)
+
+        self.assertFalse(gate.process(frame).forward)
+        decision = gate.process(frame)
+
+        self.assertTrue(decision.activated)
+        self.assertFalse(decision.forward)
+        self.assertEqual(gate.state, "waiting")
+        self.assertEqual(model.reset_calls, 1)
+        self.assertTrue(gate.process(frame).forward)
+
+    def test_initial_timeout_only_limits_when_speech_must_start(self) -> None:
+        gate, _model, now = self._gate([0.9])
+        frame = np.zeros(WAKE_FRAME_SAMPLES, dtype=np.int16)
+        gate.process(frame)
+
+        now[0] += 9
+        self.assertTrue(gate.process(frame).forward)
+        gate.mark_speech_started()
+        now[0] += 600
+
+        self.assertTrue(gate.process(frame).forward)
+        self.assertEqual(gate.state, "engaged")
+
+    def test_no_command_and_followup_inactivity_return_to_sleep(self) -> None:
+        frame = np.zeros(WAKE_FRAME_SAMPLES, dtype=np.int16)
+        gate, _model, now = self._gate([0.9, 0.0, 0.0])
+        gate.process(frame)
+        now[0] += 11
+
+        initial_expiry = gate.process(frame)
+        self.assertTrue(initial_expiry.timed_out)
+        self.assertFalse(initial_expiry.forward)
+        self.assertEqual(gate.state, "sleeping")
+
+        now[0] += 1
+        gate._model.scores = [0.9, 0.0]
+        gate.process(frame)
+        gate.mark_speech_started()
+        gate.mark_speech_stopped()
+        gate.mark_response_started()
+        gate.mark_response_done()
+        now[0] += 21
+
+        followup_expiry = gate.process(frame)
+        self.assertTrue(followup_expiry.timed_out)
+        self.assertFalse(followup_expiry.forward)
+        self.assertEqual(gate.state, "sleeping")
+
+
+class RealtimeWakeWordIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_receive_does_not_forward_audio_until_after_activation_frame(self) -> None:
+        model = _FakeWakeModel([0.0, 0.9])
+        gate = WakeWordGate(
+            Path(__file__),
+            model_factory=lambda _path: model,
+        )
+        gate.load()
+        append = AsyncMock()
+        handler = object.__new__(OpenAIRealtimeHandler)
+        handler.connection = SimpleNamespace(
+            input_audio_buffer=SimpleNamespace(append=append)
+        )
+        handler._openclaw_has_control = False
+        handler._speaking_until = 0.0
+        handler._wake_word_gate = gate
+        handler.deps = SimpleNamespace(
+            daemon_face_tracking=False,
+            movement_manager=SimpleNamespace(
+                set_listening=Mock(),
+                set_processing=Mock(),
+            ),
+        )
+        frame = np.zeros(WAKE_FRAME_SAMPLES, dtype=np.int16)
+
+        await handler.receive((16_000, frame))
+        await handler.receive((16_000, frame))
+        append.assert_not_awaited()
+
+        await handler.receive((16_000, frame))
+        append.assert_awaited_once()
 
 
 class ContinuityRpcTests(unittest.IsolatedAsyncioTestCase):

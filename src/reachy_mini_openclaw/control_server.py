@@ -41,6 +41,7 @@ class ClawBodyControlServer:
         self._acquire_callback: Callable[[str], Awaitable[None]] | None = None
         self._release_callback: Callable[[], None] | None = None
         self._lease_status_callback: Callable[[], str] | None = None
+        self._wake_status_callback: Callable[[], str] | None = None
 
     def set_speak_callback(
         self, callback: Callable[[str], Awaitable[dict[str, Any]]]
@@ -56,6 +57,9 @@ class ClawBodyControlServer:
         self._acquire_callback = acquire
         self._release_callback = release
         self._lease_status_callback = status
+
+    def set_wake_status_callback(self, callback: Callable[[], str]) -> None:
+        self._wake_status_callback = callback
 
     async def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +101,10 @@ class ClawBodyControlServer:
             "face_detected": face_detected,
             "control_owner": (
                 self._lease_status_callback() if self._lease_status_callback else "unknown"
+            ),
+            "wake_word": "Hey Claude" if self._wake_status_callback else "disabled",
+            "wake_word_state": (
+                self._wake_status_callback() if self._wake_status_callback else "disabled"
             ),
         }
 

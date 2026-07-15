@@ -40,6 +40,24 @@ class Config:
     REACHY_BARGE_IN: bool = field(
         default_factory=lambda: os.getenv("REACHY_BARGE_IN", "false").lower() == "true"
     )
+    REACHY_WAKE_WORD_ENABLED: bool = field(
+        default_factory=lambda: os.getenv("REACHY_WAKE_WORD_ENABLED", "false").lower() == "true"
+    )
+    REACHY_WAKE_WORD_MODEL: str = field(
+        default_factory=lambda: os.getenv(
+            "REACHY_WAKE_WORD_MODEL",
+            str(Path(__file__).resolve().parent / "models" / "hey_claude.onnx"),
+        )
+    )
+    REACHY_WAKE_WORD_THRESHOLD: float = field(
+        default_factory=lambda: float(os.getenv("REACHY_WAKE_WORD_THRESHOLD", "0.5"))
+    )
+    REACHY_WAKE_WORD_INITIAL_TIMEOUT_SECONDS: float = field(
+        default_factory=lambda: float(os.getenv("REACHY_WAKE_WORD_INITIAL_TIMEOUT_SECONDS", "10"))
+    )
+    REACHY_WAKE_WORD_FOLLOWUP_TIMEOUT_SECONDS: float = field(
+        default_factory=lambda: float(os.getenv("REACHY_WAKE_WORD_FOLLOWUP_TIMEOUT_SECONDS", "20"))
+    )
     REACHY_VOICE_MODE: str = field(
         default_factory=lambda: os.getenv("REACHY_VOICE_MODE", "direct").lower()
     )
@@ -98,6 +116,8 @@ class Config:
             errors.append("OPENAI_API_KEY is required")
         if self.REACHY_VOICE_MODE not in {"direct", "openclaw"}:
             errors.append("REACHY_VOICE_MODE must be 'direct' or 'openclaw'")
+        if self.REACHY_WAKE_WORD_ENABLED and self.REACHY_VOICE_MODE != "direct":
+            errors.append("REACHY_WAKE_WORD_ENABLED requires REACHY_VOICE_MODE=direct")
         return errors
 
 
