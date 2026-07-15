@@ -7,6 +7,7 @@ from reachy_mini_openclaw.openclaw_bridge import (
     OpenClawBridge,
     OpenClawContinuityError,
 )
+from reachy_mini_openclaw.openai_realtime import build_direct_voice_instructions
 
 
 class ContinuityRpcTests(unittest.IsolatedAsyncioTestCase):
@@ -17,7 +18,9 @@ class ContinuityRpcTests(unittest.IsolatedAsyncioTestCase):
                 "ok": True,
                 "payload": {
                     "revision": "abc",
+                    "identity": "My name is Claude.",
                     "soul": "Be useful.",
+                    "user": "Dylan is the owner.",
                     "capsule": "No context.",
                 },
             }
@@ -26,6 +29,7 @@ class ContinuityRpcTests(unittest.IsolatedAsyncioTestCase):
         payload = await bridge.get_reachy_continuity_context()
 
         self.assertEqual(payload["revision"], "abc")
+        self.assertEqual(payload["identity"], "My name is Claude.")
         bridge._send_request.assert_awaited_once_with(
             "reachy.continuity.context", {}, timeout=5
         )
@@ -76,6 +80,23 @@ class ControlLeaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"status": "success"})
         self.assertEqual(events, ["acquire:speak", "speak:Hello", "release"])
+
+
+class DirectVoicePromptTests(unittest.TestCase):
+    def test_prompt_makes_the_complete_identity_stack_authoritative(self) -> None:
+        prompt = build_direct_voice_instructions(
+            "My name is Claude Bochman.",
+            "Be warm, capable, and opinionated.",
+            "Dylan and Julia share two homes.",
+            "Recently discussed dinner.",
+        )
+
+        self.assertLess(prompt.index("# Voice identity contract"), prompt.index("<identity-md>"))
+        self.assertIn("You are not a separate generic voice assistant", prompt)
+        self.assertIn("My name is Claude Bochman.", prompt)
+        self.assertIn("Be warm, capable, and opinionated.", prompt)
+        self.assertIn("Dylan and Julia share two homes.", prompt)
+        self.assertIn("Recently discussed dinner.", prompt)
 
 
 if __name__ == "__main__":

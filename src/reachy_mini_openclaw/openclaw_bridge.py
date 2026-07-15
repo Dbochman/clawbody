@@ -307,7 +307,7 @@ class OpenClawBridge:
         return f"agent:{self.agent_id}:{self.session_key}"
 
     async def get_reachy_continuity_context(self) -> dict:
-        """Fetch SOUL plus the expiring capsule without running an agent turn."""
+        """Fetch OpenClaw's identity stack without running an agent turn."""
         response = await self._send_request(
             "reachy.continuity.context",
             {},
@@ -321,7 +321,8 @@ class OpenClawBridge:
         payload = response.get("payload")
         if not isinstance(payload, dict):
             raise OpenClawContinuityError("Reachy continuity returned an invalid payload")
-        if not all(isinstance(payload.get(key), str) for key in ("revision", "soul", "capsule")):
+        required = ("revision", "identity", "soul", "user", "capsule")
+        if not all(isinstance(payload.get(key), str) for key in required):
             raise OpenClawContinuityError("Reachy continuity payload is incomplete")
         return payload
 
