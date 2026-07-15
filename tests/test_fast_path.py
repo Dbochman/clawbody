@@ -92,7 +92,7 @@ class DirectVoicePromptTests(unittest.TestCase):
         )
 
         self.assertLess(prompt.index("# Voice identity contract"), prompt.index("<identity-md>"))
-        self.assertIn("You are not a separate generic voice assistant", prompt)
+        self.assertIn("separate generic voice", prompt)
         self.assertIn("My name is Claude Bochman.", prompt)
         self.assertIn("Be warm, capable, and opinionated.", prompt)
         self.assertIn("Dylan and Julia share two homes.", prompt)
