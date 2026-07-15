@@ -170,6 +170,71 @@ class HeadLookMove(Move):
         return (head_pose, antennas.astype(np.float64), 0.0)
 
 
+class ExpressiveDanceMove(Move):
+    """A visible, dependency-free dance that returns smoothly to neutral."""
+
+    SUPPORTED = {"happy", "excited", "wave", "nod", "shake", "bounce"}
+
+    def __init__(self, name: str, duration: float = 3.2):
+        if name not in self.SUPPORTED:
+            raise ValueError(f"Unsupported dance: {name}")
+        self.name = name
+        self._duration = duration
+
+    @property
+    def duration(self) -> float:
+        return self._duration
+
+    def evaluate(self, t: float) -> tuple:
+        progress = min(t, self._duration) / self._duration
+        phase = 2 * np.pi * progress
+        envelope = np.sin(np.pi * progress)
+        roll = pitch = yaw = z = body_yaw = 0.0
+        left_ant = right_ant = 0.0
+
+        if self.name == "wave":
+            yaw = np.deg2rad(15) * np.sin(3 * phase)
+            roll = np.deg2rad(6) * np.sin(3 * phase)
+            left_ant = np.deg2rad(50) * np.sin(5 * phase)
+            right_ant = -left_ant
+        elif self.name == "nod":
+            pitch = np.deg2rad(18) * np.sin(4 * phase)
+            left_ant = right_ant = np.deg2rad(22) * np.sin(4 * phase)
+        elif self.name == "shake":
+            yaw = np.deg2rad(25) * np.sin(4 * phase)
+            body_yaw = np.deg2rad(12) * np.sin(2 * phase)
+        elif self.name == "bounce":
+            z = 0.012 * (0.5 + 0.5 * np.sin(4 * phase - np.pi / 2))
+            pitch = np.deg2rad(8) * np.sin(4 * phase)
+            left_ant = right_ant = np.deg2rad(30) * np.sin(4 * phase)
+        elif self.name == "happy":
+            yaw = np.deg2rad(18) * np.sin(3 * phase)
+            z = 0.008 * (0.5 + 0.5 * np.sin(3 * phase - np.pi / 2))
+            left_ant = np.deg2rad(40) * np.sin(4 * phase)
+            right_ant = -left_ant
+        elif self.name == "excited":
+            yaw = np.deg2rad(22) * np.sin(5 * phase)
+            pitch = np.deg2rad(12) * np.sin(4 * phase)
+            z = 0.010 * (0.5 + 0.5 * np.sin(5 * phase - np.pi / 2))
+            left_ant = np.deg2rad(50) * np.sin(6 * phase)
+            right_ant = -left_ant
+
+        head_pose = create_head_pose(
+            x=0,
+            y=0,
+            z=z * envelope,
+            roll=roll * envelope,
+            pitch=pitch * envelope,
+            yaw=yaw * envelope,
+            degrees=False,
+            mm=False,
+        )
+        antennas = np.array(
+            [left_ant * envelope, right_ant * envelope], dtype=np.float64
+        )
+        return (head_pose, antennas, body_yaw * envelope)
+
+
 def combine_full_body(primary: FullBodyPose, secondary: FullBodyPose) -> FullBodyPose:
     """Combine primary pose with secondary offsets."""
     primary_head, primary_ant, primary_yaw = primary
@@ -377,20 +442,28 @@ class MovementManager:
         amp = self._thinking_amplitude
         t = current_time - self._processing_start_time
         
-        # Head offsets (radians / metres -- degrees=False, mm=False)
-        # Slow yaw drift: ±12° at 0.15 Hz
-        yaw = amp * np.deg2rad(12) * np.sin(2 * np.pi * 0.15 * t)
-        # Slight upward pitch: 6° base + 3° oscillation at 0.2 Hz
-        pitch = amp * (np.deg2rad(6) + np.deg2rad(3) * np.sin(2 * np.pi * 0.2 * t))
-        # Gentle z bob: 3 mm at 0.12 Hz
-        z = amp * 0.003 * np.sin(2 * np.pi * 0.12 * t)
-        
-        self.state.thinking_offsets = (0.0, 0.0, z, 0.0, pitch, yaw)
-        
-        # Antenna offsets: asymmetric scan (phase offset creates "searching" feel)
-        # ±20° at 0.4 Hz, right antenna lags left by ~70° of phase
-        left_ant = amp * np.deg2rad(20) * np.sin(2 * np.pi * 0.4 * t)
-        right_ant = amp * np.deg2rad(20) * np.sin(2 * np.pi * 0.4 * t + 1.2)
+        # Deliberately recognizable "thinking" silhouette: look slightly up and
+        # to one side, tilt the head, and hold the antennas asymmetrically. Slow
+        # motion keeps it alive without reading as a dance.
+        yaw = amp * (
+            np.deg2rad(14) + np.deg2rad(5) * np.sin(2 * np.pi * 0.22 * t)
+        )
+        pitch = amp * (
+            np.deg2rad(11) + np.deg2rad(2) * np.sin(2 * np.pi * 0.18 * t)
+        )
+        roll = amp * (
+            np.deg2rad(-8) + np.deg2rad(2) * np.sin(2 * np.pi * 0.25 * t)
+        )
+        z = amp * (0.004 + 0.002 * np.sin(2 * np.pi * 0.16 * t))
+
+        self.state.thinking_offsets = (0.0, 0.0, z, roll, pitch, yaw)
+
+        left_ant = amp * (
+            np.deg2rad(42) + np.deg2rad(8) * np.sin(2 * np.pi * 0.35 * t)
+        )
+        right_ant = amp * (
+            np.deg2rad(-24) + np.deg2rad(7) * np.sin(2 * np.pi * 0.35 * t + 1.2)
+        )
         self._thinking_antenna_offsets = (left_ant, right_ant)
         
     def _handle_command(self, cmd: str, payload: Any, current_time: float) -> None:

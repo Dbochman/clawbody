@@ -41,7 +41,7 @@ class Config:
     ENABLE_FACE_TRACKING: bool = field(default_factory=lambda: os.getenv("ENABLE_FACE_TRACKING", "true").lower() == "true")
     
     # Face Tracking Configuration
-    # Options: "yolo", "mediapipe", or None for auto-detect
+    # Options: "daemon" (Reachy Wireless 1.9+), "yolo", or "mediapipe"
     HEAD_TRACKER_TYPE: Optional[str] = field(default_factory=lambda: os.getenv("HEAD_TRACKER_TYPE", "yolo"))
     
     # Local Vision Processing

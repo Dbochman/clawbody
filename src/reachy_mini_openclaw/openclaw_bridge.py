@@ -21,7 +21,7 @@ from reachy_mini_openclaw.config import config
 logger = logging.getLogger(__name__)
 
 # Protocol version supported by this client
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 
 @dataclass
@@ -135,12 +135,8 @@ class OpenClawBridge:
             "set" if self.gateway_token else "not set",
         )
         try:
-            # Build origin header from the gateway URL so the control-UI
-            # origin check accepts programmatic WebSocket clients.
-            origin = self.gateway_url.replace("ws://", "http://").replace("wss://", "https://")
             self._ws = await websockets.connect(
                 self.gateway_url,
-                origin=origin,
                 ping_interval=20,
                 ping_timeout=30,
                 close_timeout=5,
@@ -163,13 +159,13 @@ class OpenClawBridge:
                     "maxProtocol": PROTOCOL_VERSION,
                     "auth": {"token": self.gateway_token} if self.gateway_token else {},
                     "client": {
-                        "id": "openclaw-control-ui",
+                        "id": "gateway-client",
                         "version": "1.0.0",
                         "platform": "linux",
-                        "mode": "webchat",
+                        "mode": "backend",
                     },
                     "role": "operator",
-                    "scopes": ["chat", "operator.write", "operator.read"],
+                    "scopes": ["operator.write", "operator.read"],
                 },
             }
             await self._ws.send(json.dumps(connect_req))

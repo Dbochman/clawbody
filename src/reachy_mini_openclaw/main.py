@@ -165,6 +165,7 @@ class ClawBodyCore:
         from reachy_mini_openclaw.audio.head_wobbler import HeadWobbler
         from reachy_mini_openclaw.openclaw_bridge import OpenClawBridge
         from reachy_mini_openclaw.tools.core_tools import ToolDependencies
+        from reachy_mini_openclaw.control_server import ClawBodyControlServer
         from reachy_mini_openclaw.openai_realtime import OpenAIRealtimeHandler
         
         self.gateway_url = gateway_url
@@ -219,15 +220,21 @@ class ClawBodyCore:
         # Camera worker for video streaming and frame capture
         self.camera_worker = None
         self.head_tracker = None
+        self._daemon_head_tracking = False
         self.vision_manager = None
         
         if enable_camera:
             logger.info("Initializing camera worker...")
             from reachy_mini_openclaw.camera_worker import CameraWorker
             
-            # Initialize head tracker for local face tracking
+            # Reachy Mini Wireless 1.9+ can track faces in the daemon. This avoids
+            # loading a second detector and blends tracking with expressive moves.
             if config.ENABLE_FACE_TRACKING:
-                self.head_tracker = self._initialize_head_tracker(config.HEAD_TRACKER_TYPE)
+                if config.HEAD_TRACKER_TYPE == "daemon":
+                    self._daemon_head_tracking = True
+                    logger.info("Using Reachy daemon face tracker")
+                else:
+                    self.head_tracker = self._initialize_head_tracker(config.HEAD_TRACKER_TYPE)
             
             # Initialize camera worker with head tracker
             self.camera_worker = CameraWorker(
@@ -250,13 +257,17 @@ class ClawBodyCore:
             camera_worker=self.camera_worker,
             openclaw_bridge=self.openclaw_bridge,
             vision_manager=self.vision_manager,
+            daemon_face_tracking=self._daemon_head_tracking,
         )
+        self.control_server = ClawBodyControlServer(self.deps)
         
         # Initialize OpenAI Realtime handler with OpenClaw bridge
         self.handler = OpenAIRealtimeHandler(
             deps=self.deps,
             openclaw_bridge=self.openclaw_bridge,
         )
+        self.deps.suppress_input = self.handler.suppress_input_for
+        self.control_server.set_speak_callback(self.handler.speak_text)
         
         # State
         self._stop_event = asyncio.Event()
@@ -427,6 +438,13 @@ class ClawBodyCore:
         logger.info("Starting movement system...")
         self.movement_manager.start()
         self.head_wobbler.start()
+
+        if self._daemon_head_tracking:
+            try:
+                self.robot.start_head_tracking(weight=0.25)
+                logger.info("Daemon face tracking armed in speech-gated mode (weight=0.25)")
+            except Exception as e:
+                logger.error("Failed to enable daemon face tracking: %s", e)
         
         # Start camera worker for video streaming
         if self.camera_worker is not None:
@@ -437,6 +455,9 @@ class ClawBodyCore:
         if self.vision_manager is not None:
             logger.info("Starting local vision processor...")
             self.vision_manager.start()
+
+        # Start an owner-only local socket for OpenClaw-initiated robot actions.
+        await self.control_server.start()
         
         # Start audio
         logger.info("Starting audio...")
@@ -470,6 +491,15 @@ class ClawBodyCore:
         for task in self._tasks:
             if not task.done():
                 task.cancel()
+
+        self.control_server.stop()
+
+        if self._daemon_head_tracking:
+            try:
+                self.robot.stop_head_tracking()
+                logger.info("Daemon face tracking disabled")
+            except Exception as e:
+                logger.debug("Could not disable daemon face tracking: %s", e)
                 
         # Stop movement system
         self.head_wobbler.stop()
