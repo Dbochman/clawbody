@@ -106,6 +106,18 @@ def build_direct_voice_instructions(
     )
 
 
+def build_turn_detection(*, create_response: bool, barge_in: bool) -> dict[str, Any]:
+    """Build server VAD settings, keeping transcription-only mode non-interrupting."""
+    return {
+        "type": "server_vad",
+        "threshold": 0.5,
+        "prefix_padding_ms": 300,
+        "silence_duration_ms": config.OPENAI_VAD_SILENCE_MS,
+        "create_response": create_response,
+        "interrupt_response": barge_in if create_response else False,
+    }
+
+
 class OpenAIRealtimeHandler(AsyncStreamHandler):
     """Run direct voice turns and arbitrate exclusive OpenClaw robot control."""
 
@@ -138,6 +150,10 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._last_speech_stopped_at = 0.0
         self._playback_marker_turn_started: float | None = None
         self._direct_turn_started: float | None = None
+        self._playback_started_at: float | None = None
+        self._current_audio_item_id: str | None = None
+        self._current_audio_content_index = 0
+        self._current_audio_duration = 0.0
 
         self._shutdown_requested = False
         self._connected_event = asyncio.Event()
@@ -163,6 +179,7 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._response_audio = bytearray()
         self._response_audio_started = False
         self._response_active = False
+        self._discard_response_audio = False
 
     @property
     def direct_voice(self) -> bool:
@@ -258,14 +275,10 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                                 "model": config.OPENAI_TRANSCRIPTION_MODEL,
                                 "language": config.OPENAI_TRANSCRIPTION_LANGUAGE,
                             },
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": config.OPENAI_VAD_SILENCE_MS,
-                                "create_response": True,
-                                "interrupt_response": False,
-                            },
+                            "turn_detection": build_turn_detection(
+                                create_response=True,
+                                barge_in=config.REACHY_BARGE_IN,
+                            ),
                         },
                         "output": {
                             "format": {"type": "audio/pcm", "rate": OPENAI_SAMPLE_RATE},
@@ -276,10 +289,12 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                     "tool_choice": "auto",
                 }
                 logger.info(
-                    "OpenAI Realtime direct voice configured with %d tools, voice=%s, jitter=%dms",
+                    "OpenAI Realtime direct voice configured with %d tools, "
+                    "voice=%s, jitter=%dms, barge_in=%s",
                     len(tools),
                     get_session_voice(),
                     config.OPENAI_AUDIO_JITTER_MS,
+                    config.REACHY_BARGE_IN,
                 )
             else:
                 session = {
@@ -294,14 +309,10 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                                 "model": config.OPENAI_TRANSCRIPTION_MODEL,
                                 "language": config.OPENAI_TRANSCRIPTION_LANGUAGE,
                             },
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": config.OPENAI_VAD_SILENCE_MS,
-                                "create_response": False,
-                                "interrupt_response": False,
-                            },
+                            "turn_detection": build_turn_detection(
+                                create_response=False,
+                                barge_in=False,
+                            ),
                         },
                         "output": {
                             "format": {"type": "audio/pcm", "rate": OPENAI_SAMPLE_RATE},
@@ -383,13 +394,20 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
             "input_audio_buffer.speech_stopped",
             "conversation.item.input_audio_transcription.completed",
         }
-        if event_type in input_events and (
-            self._is_playing_speech() or self._openclaw_has_control
-        ):
+        if event_type in input_events and self._openclaw_has_control:
             logger.debug("Ignoring input event while Reachy is controlled/speaking: %s", event_type)
+            return
+        if (
+            event_type in input_events
+            and self._is_playing_speech()
+            and not config.REACHY_BARGE_IN
+        ):
+            logger.debug("Ignoring input event while Reachy is speaking: %s", event_type)
             return
 
         if event_type == "input_audio_buffer.speech_started":
+            if config.REACHY_BARGE_IN and self._is_audio_playing():
+                await self._interrupt_playback()
             self._turn_delegated = False
             self._last_user_message = None
             self._last_assistant_response = None
@@ -442,12 +460,23 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         elif event_type == "response.created" and self.direct_voice:
             self._speaking = True
             self._response_active = True
+            self._discard_response_audio = False
             self._response_audio.clear()
             self._response_audio_started = False
+            self._playback_started_at = None
+            self._current_audio_item_id = None
+            self._current_audio_content_index = 0
+            self._current_audio_duration = 0.0
 
         elif event_type == "response.output_audio.delta" and self.direct_voice:
-            if self._openclaw_has_control:
+            if self._openclaw_has_control or self._discard_response_audio:
                 return
+            item_id = getattr(event, "item_id", None)
+            if isinstance(item_id, str):
+                self._current_audio_item_id = item_id
+            content_index = getattr(event, "content_index", None)
+            if isinstance(content_index, int):
+                self._current_audio_content_index = content_index
             await self._handle_direct_audio_delta(event.delta)
 
         elif event_type == "response.output_audio.done" and self.direct_voice:
@@ -529,6 +558,7 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         if not chunk:
             return
         duration = len(chunk) / (2 * OPENAI_SAMPLE_RATE)
+        self._current_audio_duration += duration
         self.suppress_input_for(duration)
         if self.deps.head_wobbler is not None:
             self.deps.head_wobbler.feed(base64.b64encode(chunk).decode("ascii"))
@@ -696,6 +726,58 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
             except asyncio.QueueEmpty:
                 return
 
+    async def _interrupt_playback(self) -> None:
+        """Stop local audio immediately and truncate the assistant item to what played."""
+        now = asyncio.get_event_loop().time()
+        played_seconds = 0.0
+        if self._playback_started_at is not None:
+            played_seconds = min(
+                max(0.0, now - self._playback_started_at),
+                self._current_audio_duration,
+            )
+        item_id = self._current_audio_item_id
+        content_index = self._current_audio_content_index
+
+        self._clear_audio_queue()
+        self._response_audio.clear()
+        self._response_audio_started = False
+        self._discard_response_audio = True
+        self._speaking = False
+        self._speaking_until = now
+        self._audio_playback_until = now
+        self._playback_started_at = None
+        if self.deps.head_wobbler is not None:
+            self.deps.head_wobbler.reset()
+
+        flush_task = asyncio.create_task(
+            self._flush_robot_playback(),
+            name="reachy-audio-barge-in",
+        )
+        self._turn_tasks.add(flush_task)
+        flush_task.add_done_callback(self._turn_tasks.discard)
+
+        if self.connection is not None and item_id is not None:
+            try:
+                await self.connection.conversation.item.truncate(
+                    item_id=item_id,
+                    content_index=content_index,
+                    audio_end_ms=max(0, round(played_seconds * 1000)),
+                )
+            except Exception as exc:
+                logger.warning("Could not truncate interrupted Realtime audio: %s", exc)
+        logger.info("Barge-in stopped playback at %.0fms", played_seconds * 1000)
+
+    async def _flush_robot_playback(self) -> None:
+        try:
+            clear_player = self.deps.robot.media.audio.clear_player
+        except AttributeError:
+            logger.warning("Reachy audio backend does not expose playback flushing")
+            return
+        try:
+            await asyncio.to_thread(clear_player)
+        except Exception as exc:
+            logger.warning("Could not flush Reachy speaker playback: %s", exc)
+
     def _set_speech_tracking(self, listening: bool) -> None:
         if not self.deps.daemon_face_tracking:
             return
@@ -708,6 +790,9 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
     def _is_playing_speech(self) -> bool:
         return asyncio.get_event_loop().time() < self._speaking_until
 
+    def _is_audio_playing(self) -> bool:
+        return asyncio.get_event_loop().time() < self._audio_playback_until
+
     def suppress_input_for(self, duration_seconds: float) -> None:
         now = asyncio.get_event_loop().time()
         self._speaking = True
@@ -715,6 +800,8 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._speaking_until = self._audio_playback_until + 0.75
 
     def note_audio_playback_started(self) -> None:
+        if self._playback_started_at is None:
+            self._playback_started_at = asyncio.get_event_loop().time()
         marker = self._playback_marker_turn_started or self._direct_turn_started
         if marker is None:
             return
@@ -775,6 +862,10 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
 
         async with self._speech_lock:
             try:
+                self._playback_started_at = None
+                self._current_audio_item_id = None
+                self._current_audio_content_index = 0
+                self._current_audio_duration = 0.0
                 request_started = asyncio.get_event_loop().time()
                 speech_pcm = bytearray()
                 trailing = b""
@@ -815,14 +906,20 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                 return {"error": str(exc)}
 
     async def _queue_complete_pcm(self, chunk: bytes) -> None:
-        self.suppress_input_for(len(chunk) / (2 * OPENAI_SAMPLE_RATE))
+        duration = len(chunk) / (2 * OPENAI_SAMPLE_RATE)
+        self._current_audio_duration += duration
+        self.suppress_input_for(duration)
         if self.deps.head_wobbler is not None:
             self.deps.head_wobbler.feed(base64.b64encode(chunk).decode("ascii"))
         audio = np.frombuffer(chunk, dtype=np.int16).reshape(1, -1)
         await self.output_queue.put((OPENAI_SAMPLE_RATE, audio))
 
     async def receive(self, frame: tuple[int, NDArray]) -> None:
-        if self.connection is None or self._openclaw_has_control or self._is_playing_speech():
+        if (
+            self.connection is None
+            or self._openclaw_has_control
+            or (self._is_playing_speech() and not config.REACHY_BARGE_IN)
+        ):
             return
         input_sr, audio = frame
         if audio.ndim == 2:

@@ -11,6 +11,7 @@ from reachy_mini_openclaw.openclaw_bridge import (
 from reachy_mini_openclaw.openai_realtime import (
     OpenAIRealtimeHandler,
     build_direct_voice_instructions,
+    build_turn_detection,
 )
 
 
@@ -104,6 +105,66 @@ class RealtimeToolSchedulingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("took too long", result["error"])
+
+
+class RealtimeBargeInTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interrupt_flushes_playback_and_truncates_assistant_audio(self) -> None:
+        handler = object.__new__(OpenAIRealtimeHandler)
+        now = asyncio.get_running_loop().time()
+        clear_player = Mock()
+        truncate = AsyncMock()
+        handler.output_queue = asyncio.Queue()
+        await handler.output_queue.put((24000, object()))
+        handler._response_audio = bytearray(b"buffered")
+        handler._response_audio_started = True
+        handler._speaking = True
+        handler._speaking_until = now + 3
+        handler._audio_playback_until = now + 3
+        handler._playback_started_at = now - 1
+        handler._current_audio_duration = 2.0
+        handler._current_audio_item_id = "item-1"
+        handler._current_audio_content_index = 0
+        handler._turn_tasks = set()
+        handler.connection = SimpleNamespace(
+            conversation=SimpleNamespace(
+                item=SimpleNamespace(truncate=truncate)
+            )
+        )
+        handler.deps = SimpleNamespace(
+            robot=SimpleNamespace(
+                media=SimpleNamespace(
+                    audio=SimpleNamespace(clear_player=clear_player)
+                )
+            ),
+            head_wobbler=None,
+        )
+
+        await handler._interrupt_playback()
+        await asyncio.gather(*handler._turn_tasks)
+
+        self.assertTrue(handler.output_queue.empty())
+        self.assertEqual(handler._response_audio, bytearray())
+        clear_player.assert_called_once_with()
+        truncate.assert_awaited_once()
+        call = truncate.await_args.kwargs
+        self.assertEqual(call["item_id"], "item-1")
+        self.assertEqual(call["content_index"], 0)
+        self.assertGreaterEqual(call["audio_end_ms"], 900)
+        self.assertLessEqual(call["audio_end_ms"], 1100)
+
+
+class RealtimeVadTests(unittest.TestCase):
+    def test_direct_voice_enables_server_side_response_interruption(self) -> None:
+        settings = build_turn_detection(create_response=True, barge_in=True)
+
+        self.assertTrue(settings["create_response"])
+        self.assertTrue(settings["interrupt_response"])
+
+    def test_transcription_fallback_remains_non_interrupting(self) -> None:
+        settings = build_turn_detection(create_response=False, barge_in=True)
+
+        self.assertFalse(settings["create_response"])
+        self.assertFalse(settings["interrupt_response"])
 
 
 class ContinuityRpcTests(unittest.IsolatedAsyncioTestCase):

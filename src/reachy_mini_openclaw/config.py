@@ -37,6 +37,9 @@ class Config:
     OPENAI_AUDIO_JITTER_MS: int = field(
         default_factory=lambda: int(os.getenv("OPENAI_AUDIO_JITTER_MS", "220"))
     )
+    REACHY_BARGE_IN: bool = field(
+        default_factory=lambda: os.getenv("REACHY_BARGE_IN", "false").lower() == "true"
+    )
     REACHY_VOICE_MODE: str = field(
         default_factory=lambda: os.getenv("REACHY_VOICE_MODE", "direct").lower()
     )
