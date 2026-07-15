@@ -1,13 +1,100 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from reachy_mini_openclaw.control_server import ClawBodyControlServer
 from reachy_mini_openclaw.openclaw_bridge import (
     OpenClawBridge,
     OpenClawContinuityError,
 )
-from reachy_mini_openclaw.openai_realtime import build_direct_voice_instructions
+from reachy_mini_openclaw.openai_realtime import (
+    OpenAIRealtimeHandler,
+    build_direct_voice_instructions,
+)
+
+
+class GatewayEventBufferTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fast_completion_events_are_replayed_after_run_registration(self) -> None:
+        bridge = OpenClawBridge()
+        bridge._connected = True
+
+        async def send_request(*_args, **_kwargs):
+            await bridge._dispatch({
+                "type": "event",
+                "event": "agent",
+                "payload": {
+                    "runId": "run-fast",
+                    "stream": "assistant",
+                    "data": {"text": "REACHY_DELEGATION_OK"},
+                },
+            })
+            await bridge._dispatch({
+                "type": "event",
+                "event": "chat",
+                "payload": {
+                    "runId": "run-fast",
+                    "state": "final",
+                    "message": {
+                        "content": [{"type": "text", "text": "REACHY_DELEGATION_OK"}]
+                    },
+                },
+            })
+            return {"ok": True, "payload": {"runId": "run-fast"}}
+
+        bridge._send_request = AsyncMock(side_effect=send_request)
+
+        response = await bridge.chat("Reply with the marker")
+
+        self.assertEqual(response.error, None)
+        self.assertEqual(response.content, "REACHY_DELEGATION_OK")
+        self.assertNotIn("run-fast", bridge._early_run_events)
+        self.assertNotIn("run-fast", bridge._run_events)
+
+
+class RealtimeToolSchedulingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_call_does_not_block_realtime_event_handling(self) -> None:
+        handler = object.__new__(OpenAIRealtimeHandler)
+        handler._active_tool_calls = 0
+        handler._turn_tasks = set()
+        handler._response_active = True
+        handler.deps = SimpleNamespace(
+            movement_manager=SimpleNamespace(set_processing=Mock())
+        )
+        release_tool = asyncio.Event()
+
+        async def handle_tool(_event) -> None:
+            await release_tool.wait()
+
+        handler._handle_tool_call = handle_tool
+        event = SimpleNamespace(
+            type="response.function_call_arguments.done",
+            name="ask_openclaw",
+        )
+
+        await handler._handle_event(event)
+
+        self.assertEqual(handler._active_tool_calls, 1)
+        self.assertEqual(len(handler._turn_tasks), 1)
+        self.assertFalse(next(iter(handler._turn_tasks)).done())
+
+        release_tool.set()
+        await asyncio.gather(*handler._turn_tasks)
+        await asyncio.sleep(0)
+        self.assertEqual(handler._active_tool_calls, 0)
+
+    async def test_delegation_timeout_returns_a_tool_error(self) -> None:
+        handler = object.__new__(OpenAIRealtimeHandler)
+        handler.openclaw_bridge = SimpleNamespace(
+            is_connected=True,
+            chat=AsyncMock(side_effect=TimeoutError),
+        )
+
+        result = await handler._handle_openclaw_query(
+            '{"query":"Use an OpenClaw skill"}'
+        )
+
+        self.assertIn("took too long", result["error"])
 
 
 class ContinuityRpcTests(unittest.IsolatedAsyncioTestCase):

@@ -148,6 +148,7 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._turn_tasks: set[asyncio.Task] = set()
         self._summary_tasks: set[asyncio.Task] = set()
         self._context_task: asyncio.Task | None = None
+        self._active_tool_calls = 0
 
         self._context_revision: str | None = None
         self._system_instructions = build_direct_voice_instructions(
@@ -462,13 +463,21 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                 )
 
         elif event_type == "response.function_call_arguments.done" and self.direct_voice:
-            await self._handle_tool_call(event)
+            self._active_tool_calls += 1
+            self.deps.movement_manager.set_processing(True)
+            task = asyncio.create_task(
+                self._handle_tool_call(event),
+                name=f"reachy-tool-{getattr(event, 'name', 'unknown')}",
+            )
+            self._turn_tasks.add(task)
+            task.add_done_callback(self._tool_call_finished)
 
         elif event_type == "response.done" and self.direct_voice:
             await self._flush_direct_audio(force=True)
             self._speaking = False
             self._response_active = False
-            self.deps.movement_manager.set_processing(False)
+            if self._active_tool_calls == 0:
+                self.deps.movement_manager.set_processing(False)
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
             self._schedule_continuity_summary()
@@ -534,7 +543,7 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         if not all(isinstance(value, str) for value in (tool_name, arguments, call_id)):
             return
         logger.info("Direct voice tool: %s", tool_name)
-        self.deps.movement_manager.set_processing(True)
+        connection = self.connection
         try:
             if tool_name == "ask_openclaw":
                 self._turn_delegated = True
@@ -544,16 +553,29 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         except Exception as exc:
             logger.error("Tool %s failed: %s", tool_name, exc, exc_info=True)
             result = {"error": str(exc)}
-        if self.connection is None:
+        if connection is None or self.connection is not connection:
+            logger.warning("Discarding stale tool result for %s after Realtime reconnect", tool_name)
             return
-        await self.connection.conversation.item.create(
+        await connection.conversation.item.create(
             item={
                 "type": "function_call_output",
                 "call_id": call_id,
                 "output": json.dumps(result),
             }
         )
-        await self.connection.response.create()
+        await connection.response.create()
+
+    def _tool_call_finished(self, task: asyncio.Task) -> None:
+        self._turn_tasks.discard(task)
+        self._active_tool_calls = max(0, self._active_tool_calls - 1)
+        if self._active_tool_calls == 0 and not self._response_active:
+            self.deps.movement_manager.set_processing(False)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            logger.error("Background Realtime tool task failed: %s", exc, exc_info=True)
 
     async def _handle_openclaw_query(self, arguments: str) -> dict[str, Any]:
         try:
@@ -569,16 +591,28 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                 return {"error": "OpenClaw is temporarily unreachable"}
 
         logger.info("Delegating direct voice request to OpenClaw: %s", query[:120])
-        response = await self.openclaw_bridge.chat(
-            query,
-            system_context=(
-                "This request came from Dylan through the physically secured Reachy Mini. "
-                "Use all appropriate skills and personal context. You may control Reachy with "
-                "reachyctl while working. Return a concise natural answer for the direct Cedar "
-                "voice agent to speak. Do not call reachyctl speak for the final answer because "
-                "the direct voice session will vocalize it."
-            ),
-        )
+        try:
+            response = await asyncio.wait_for(
+                self.openclaw_bridge.chat(
+                    query,
+                    system_context=(
+                        "This request came from Dylan through the physically secured Reachy Mini. "
+                        "Use all appropriate skills and personal context. You may control Reachy with "
+                        "reachyctl while working. Return a concise natural answer for the direct Cedar "
+                        "voice agent to speak. Do not call reachyctl speak for the final answer because "
+                        "the direct voice session will vocalize it."
+                    ),
+                ),
+                timeout=max(5.0, config.OPENCLAW_DELEGATION_TIMEOUT_SECONDS),
+            )
+        except TimeoutError:
+            logger.warning(
+                "OpenClaw delegation exceeded %.1fs",
+                config.OPENCLAW_DELEGATION_TIMEOUT_SECONDS,
+            )
+            return {
+                "error": "OpenClaw is still working but took too long for this voice turn."
+            }
         if response.error:
             return {"error": response.error}
         return {"response": response.content}

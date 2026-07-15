@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 # Protocol version supported by this client
 PROTOCOL_VERSION = 4
+MAX_BUFFERED_RUNS = 32
+MAX_BUFFERED_EVENTS_PER_RUN = 128
 
 
 @dataclass
@@ -96,6 +99,9 @@ class OpenClawBridge:
         self._pending: dict[str, asyncio.Future] = {}
         # Events keyed by runId -> list of event payloads
         self._run_events: dict[str, asyncio.Queue] = {}
+        # A fast gateway run can emit events before chat.send returns its runId.
+        # Retain a small bounded buffer so those completions are not lost.
+        self._early_run_events: dict[str, deque[dict]] = {}
 
     # ------------------------------------------------------------------
     # URL helpers
@@ -258,14 +264,36 @@ class OpenClawBridge:
 
             # Route agent / chat events to the correct run queue
             run_id = payload.get("runId")
-            if run_id and run_id in self._run_events:
-                await self._run_events[run_id].put(msg)
+            if run_id:
+                event_queue = self._run_events.get(run_id)
+                if event_queue is not None:
+                    await event_queue.put(msg)
+                else:
+                    if run_id not in self._early_run_events:
+                        if len(self._early_run_events) >= MAX_BUFFERED_RUNS:
+                            self._early_run_events.pop(next(iter(self._early_run_events)))
+                        self._early_run_events[run_id] = deque(
+                            maxlen=MAX_BUFFERED_EVENTS_PER_RUN
+                        )
+                    self._early_run_events[run_id].append(msg)
 
             # Ignore noisy events silently
             if event_name in ("health", "tick"):
                 return
 
             logger.debug("Event: %s (runId=%s)", event_name, run_id)
+
+    def _register_run_queue(self, run_id: str) -> asyncio.Queue:
+        """Register a run consumer and replay events that arrived early."""
+        event_queue: asyncio.Queue = asyncio.Queue()
+        self._run_events[run_id] = event_queue
+        for event in self._early_run_events.pop(run_id, ()):
+            event_queue.put_nowait(event)
+        return event_queue
+
+    def _unregister_run_queue(self, run_id: str) -> None:
+        self._run_events.pop(run_id, None)
+        self._early_run_events.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # Request helpers
@@ -405,8 +433,7 @@ class OpenClawBridge:
                 return OpenClawResponse(content="", error="No runId in response")
 
             # Register a queue to receive events for this run
-            event_queue: asyncio.Queue = asyncio.Queue()
-            self._run_events[run_id] = event_queue
+            event_queue = self._register_run_queue(run_id)
 
             try:
                 # Collect the streamed response
@@ -452,7 +479,7 @@ class OpenClawBridge:
                 return OpenClawResponse(content=full_text)
 
             finally:
-                self._run_events.pop(run_id, None)
+                self._unregister_run_queue(run_id)
 
         except Exception as e:
             logger.error("OpenClaw chat error: %s", e)
@@ -502,8 +529,7 @@ class OpenClawBridge:
             if not run_id:
                 raise OpenClawStreamError("No runId in response")
 
-            event_queue: asyncio.Queue = asyncio.Queue()
-            self._run_events[run_id] = event_queue
+            event_queue = self._register_run_queue(run_id)
 
             try:
                 prev_text = ""
@@ -583,7 +609,7 @@ class OpenClawBridge:
                             break
                         raise OpenClawStreamError("Response timeout")
             finally:
-                self._run_events.pop(run_id, None)
+                self._unregister_run_queue(run_id)
 
         except OpenClawStreamError:
             raise

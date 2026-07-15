@@ -63,6 +63,9 @@ class Config:
     OPENCLAW_STREAM_SETTLE_MS: int = field(
         default_factory=lambda: int(os.getenv("OPENCLAW_STREAM_SETTLE_MS", "350"))
     )
+    OPENCLAW_DELEGATION_TIMEOUT_SECONDS: float = field(
+        default_factory=lambda: float(os.getenv("OPENCLAW_DELEGATION_TIMEOUT_SECONDS", "75"))
+    )
     
     # Robot Configuration
     ROBOT_NAME: Optional[str] = field(default_factory=lambda: os.getenv("ROBOT_NAME"))
