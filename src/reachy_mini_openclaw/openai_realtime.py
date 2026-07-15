@@ -312,25 +312,35 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                     return
 
             logger.info("Routing voice turn directly to OpenClaw (full-response buffer)")
-            response = await self.openclaw_bridge.chat(
-                transcript,
-                system_context=(
-                    "This is a direct voice turn from the authenticated, physically "
-                    "secured Reachy Mini session. You are the sole conversational "
-                    "agent: use your memory, personality, tools, and the reachy-control "
-                    "skill directly. Perform requested robot actions before replying "
-                    "and never claim an action succeeded unless its command confirmed "
-                    "success. Your complete final response is spoken verbatim through "
-                    "Reachy, so make it concise and natural for voice. Do not call "
-                    "reachyctl speak during this session; the bridge vocalizes your "
-                    "response automatically."
-                ),
-            )
-            if response.error:
-                logger.warning("OpenClaw turn failed: %s", response.error)
+            reply_parts: list[str] = []
+            first_text_seen = False
+            try:
+                async for delta in self.openclaw_bridge.stream_chat(
+                    transcript,
+                    system_context=(
+                        "This is a direct voice turn from the authenticated, physically "
+                        "secured Reachy Mini session. You are the sole conversational "
+                        "agent: use your memory, personality, tools, and the reachy-control "
+                        "skill directly. Perform requested robot actions before replying "
+                        "and never claim an action succeeded unless its command confirmed "
+                        "success. Your complete final response is spoken verbatim through "
+                        "Reachy, so make it concise and natural for voice. Do not call "
+                        "reachyctl speak during this session; the bridge vocalizes your "
+                        "response automatically."
+                    ),
+                ):
+                    if not first_text_seen:
+                        first_text_seen = True
+                        logger.info(
+                            "Latency OpenClaw first text: %.0fms",
+                            (loop.time() - turn_started) * 1000,
+                        )
+                    reply_parts.append(delta)
+            except Exception as exc:
+                logger.warning("OpenClaw turn failed: %s", exc)
                 reply = "I'm having trouble reaching my OpenClaw brain right now."
             else:
-                reply = response.content.strip()
+                reply = "".join(reply_parts).strip()
                 if not reply:
                     reply = "I didn't get a response from OpenClaw."
 
