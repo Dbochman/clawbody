@@ -36,7 +36,7 @@ def _ensure_openwakeword_assets() -> None:
     except ModuleNotFoundError as exc:
         raise WakeWordError(
             "openwakeword is required when REACHY_WAKE_WORD_ENABLED=true; "
-            "install ClawBody with .[wake_word]"
+            "install the ONNX runtime as documented in the ClawBody README"
         ) from exc
 
     target = Path(openwakeword.__file__).resolve().parent / "resources" / "models"

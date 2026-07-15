@@ -205,7 +205,7 @@ OPENAI_MODEL=gpt-realtime-2.1-mini
 OPENAI_VOICE=cedar
 OPENAI_AUDIO_JITTER_MS=220
 
-# Optional local wake-word gate (install with `pip install -e ".[wake_word]"`)
+# Optional local wake-word gate (see the device install note below)
 REACHY_WAKE_WORD_ENABLED=true
 REACHY_WAKE_WORD_THRESHOLD=0.5
 REACHY_WAKE_WORD_INITIAL_TIMEOUT_SECONDS=10
@@ -230,6 +230,17 @@ The face tracker and listening pose activate immediately when the wake phrase is
 detected. `reachyctl status` reports `wake_word_state` as `sleeping`, `waiting`,
 or `engaged`. Raise `REACHY_WAKE_WORD_THRESHOLD` to reduce false activations, or
 lower it if intended wakes are missed.
+
+Install the optional runtime with `pip install -e ".[wake_word]"` on platforms
+where openWakeWord's full dependencies are available. Reachy Mini's Python 3.12
+ARM environment uses only ONNX, while openWakeWord declares an unused
+`tflite-runtime` dependency for all Linux systems that has no matching wheel.
+Install the same pinned package there without that unused dependency:
+
+```bash
+/venvs/apps_venv/bin/pip install --no-deps openwakeword==0.6.0
+/venvs/apps_venv/bin/pip install -e .
+```
 
 ## 🎮 Usage
 
