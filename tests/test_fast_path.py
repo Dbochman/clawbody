@@ -34,10 +34,19 @@ class GatewayEventBufferTests(unittest.IsolatedAsyncioTestCase):
                 "event": "chat",
                 "payload": {
                     "runId": "run-fast",
-                    "state": "final",
+                    "state": "delta",
                     "message": {
                         "content": [{"type": "text", "text": "REACHY_DELEGATION_OK"}]
                     },
+                },
+            })
+            await bridge._dispatch({
+                "type": "event",
+                "event": "agent",
+                "payload": {
+                    "runId": "run-fast",
+                    "stream": "lifecycle",
+                    "data": {"phase": "finishing"},
                 },
             })
             return {"ok": True, "payload": {"runId": "run-fast"}}

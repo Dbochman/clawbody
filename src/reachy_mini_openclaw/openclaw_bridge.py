@@ -452,9 +452,14 @@ class OpenClawBridge:
                                 # Accumulate the full text
                                 full_text = data.get("text", full_text)
 
-                            elif stream == "lifecycle" and data.get("phase") == "end":
-                                # Run completed
-                                break
+                            elif stream == "lifecycle":
+                                phase = data.get("phase")
+                                if phase == "end" or (
+                                    full_text and phase in {"finishing", "error"}
+                                ):
+                                    # OpenClaw 2026.6.x emits finishing, then may emit
+                                    # error/stop, after the final assistant text.
+                                    break
 
                         elif event_name == "chat":
                             state = payload.get("state")
@@ -571,8 +576,12 @@ class OpenClawBridge:
                                 if delta:
                                     yield delta
 
-                            elif stream == "lifecycle" and data.get("phase") == "end":
-                                break
+                            elif stream == "lifecycle":
+                                phase = data.get("phase")
+                                if phase == "end" or (
+                                    prev_text and phase in {"finishing", "error"}
+                                ):
+                                    break
 
                         elif event_name == "chat" and payload.get("state") == "final":
                             message_payload = payload.get("message", {})
