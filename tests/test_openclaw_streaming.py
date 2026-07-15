@@ -6,6 +6,24 @@ from reachy_mini_openclaw.openclaw_bridge import OpenClawBridge
 
 
 @pytest.mark.asyncio
+async def test_chat_applies_low_latency_turn_options() -> None:
+    bridge = OpenClawBridge(gateway_url="ws://example.invalid")
+    bridge._connected = True
+    bridge._ws = object()
+
+    async def send_request(method: str, params: dict, timeout: float | None = None) -> dict:
+        assert method == "chat.send"
+        assert params["thinking"] == "minimal"
+        assert params["fastMode"] is True
+        return {"ok": True, "payload": {}}
+
+    bridge._send_request = send_request
+    response = await bridge.chat("hello")
+
+    assert response.error == "No runId in response"
+
+
+@pytest.mark.asyncio
 async def test_stream_chat_converts_cumulative_text_to_deltas() -> None:
     bridge = OpenClawBridge(gateway_url="ws://example.invalid")
     bridge._connected = True

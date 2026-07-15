@@ -19,7 +19,6 @@ from websockets.exceptions import ConnectionClosedError
 
 from reachy_mini_openclaw.config import config
 from reachy_mini_openclaw.prompts import get_session_voice
-from reachy_mini_openclaw.text_streaming import pop_speakable_segments
 from reachy_mini_openclaw.tools.core_tools import ToolDependencies
 
 logger = logging.getLogger(__name__)
@@ -297,7 +296,7 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._playback_marker_turn_started = None
 
     async def _run_openclaw_turn(self, transcript: str) -> None:
-        """Stream one OpenClaw-owned turn into sentence-buffered speech."""
+        """Buffer one OpenClaw-owned turn, then stream one continuous speech clip."""
         async with self._turn_lock:
             loop = asyncio.get_event_loop()
             turn_started = loop.time()
@@ -312,94 +311,43 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                     await self.speak_text("I can't reach OpenClaw right now.")
                     return
 
-            logger.info("Routing voice turn directly to OpenClaw (streaming)")
-            speech_queue: asyncio.Queue[str | None] = asyncio.Queue()
-            speech_task = asyncio.create_task(
-                self._speak_segment_queue(speech_queue, turn_started),
-                name="openclaw-streamed-speech",
+            logger.info("Routing voice turn directly to OpenClaw (full-response buffer)")
+            response = await self.openclaw_bridge.chat(
+                transcript,
+                system_context=(
+                    "This is a direct voice turn from the authenticated, physically "
+                    "secured Reachy Mini session. You are the sole conversational "
+                    "agent: use your memory, personality, tools, and the reachy-control "
+                    "skill directly. Perform requested robot actions before replying "
+                    "and never claim an action succeeded unless its command confirmed "
+                    "success. Your complete final response is spoken verbatim through "
+                    "Reachy, so make it concise and natural for voice. Do not call "
+                    "reachyctl speak during this session; the bridge vocalizes your "
+                    "response automatically."
+                ),
             )
-            reply_parts: list[str] = []
-            pending_speech = ""
-            first_text_seen = False
-
-            try:
-                async for delta in self.openclaw_bridge.stream_chat(
-                    transcript,
-                    system_context=(
-                        "This is a direct voice turn from the authenticated, physically "
-                        "secured Reachy Mini session. You are the sole conversational "
-                        "agent: use your memory, personality, tools, and the reachy-control "
-                        "skill directly. Perform requested robot actions before replying "
-                        "and never claim an action succeeded unless its command confirmed "
-                        "success. Your response is streamed sentence by sentence and spoken "
-                        "verbatim through Reachy, so make it concise and natural for voice. "
-                        "Do not call reachyctl speak during this session; the bridge "
-                        "vocalizes your response automatically."
-                    ),
-                ):
-                    if not first_text_seen:
-                        first_text_seen = True
-                        logger.info(
-                            "Latency OpenClaw first text: %.0fms",
-                            (loop.time() - turn_started) * 1000,
-                        )
-                    reply_parts.append(delta)
-                    pending_speech += delta
-                    segments, pending_speech = pop_speakable_segments(pending_speech)
-                    for segment in segments:
-                        await speech_queue.put(segment)
-            except Exception as exc:
-                logger.warning("OpenClaw streaming turn failed: %s", exc)
-                if not reply_parts:
-                    pending_speech = "I'm having trouble reaching my OpenClaw brain right now."
-
-            segments, pending_speech = pop_speakable_segments(pending_speech, final=True)
-            for segment in segments:
-                await speech_queue.put(segment)
-            await speech_queue.put(None)
-            await speech_task
-
-            reply = "".join(reply_parts).strip()
-            if not reply:
-                reply = segments[-1] if segments else "I didn't get a response from OpenClaw."
+            if response.error:
+                logger.warning("OpenClaw turn failed: %s", response.error)
+                reply = "I'm having trouble reaching my OpenClaw brain right now."
+            else:
+                reply = response.content.strip()
+                if not reply:
+                    reply = "I didn't get a response from OpenClaw."
 
             logger.info(
-                "OpenClaw streamed response complete in %.0fms: %s",
+                "Latency OpenClaw final text: %.0fms",
                 (loop.time() - turn_started) * 1000,
-                reply[:100] if len(reply) > 100 else reply,
             )
             await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": reply}))
-
-    async def _speak_segment_queue(
-        self,
-        queue: asyncio.Queue[str | None],
-        turn_started: float,
-    ) -> None:
-        """Generate sentence segments serially while OpenClaw continues streaming."""
-        segment_index = 0
-        while True:
-            segment = await queue.get()
-            if segment is None:
-                return
-            segment_index += 1
-            result = await self.speak_text(
-                segment,
-                turn_started=turn_started,
-                segment_index=segment_index,
-            )
+            result = await self.speak_text(reply, turn_started=turn_started)
             if result.get("error"):
-                logger.warning(
-                    "Could not render streamed speech segment %d: %s",
-                    segment_index,
-                    result["error"],
-                )
+                logger.warning("Could not render buffered OpenClaw speech: %s", result["error"])
 
     async def speak_text(
         self,
         text: str,
         *,
         turn_started: float | None = None,
-        segment_index: int | None = None,
     ) -> dict[str, Any]:
         """Render OpenClaw-provided text through the active Realtime voice."""
         text = text.strip()
@@ -441,8 +389,7 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                             first_chunk = False
                             if turn_started is not None:
                                 logger.info(
-                                    "Latency first TTS byte (segment %d): %.0fms",
-                                    segment_index or 1,
+                                    "Latency first TTS byte: %.0fms",
                                     (asyncio.get_event_loop().time() - turn_started) * 1000,
                                 )
                                 if self._playback_marker_turn_started is None:
@@ -469,7 +416,7 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
                 duration_seconds = total_bytes / (2 * OPENAI_SAMPLE_RATE)
                 self.last_activity_time = asyncio.get_event_loop().time()
                 logger.info(
-                    "Streamed exact OpenClaw speech segment in %.0fms: %s",
+                    "Streamed complete OpenClaw speech in %.0fms: %s",
                     (asyncio.get_event_loop().time() - request_started) * 1000,
                     text[:100] if len(text) > 100 else text,
                 )

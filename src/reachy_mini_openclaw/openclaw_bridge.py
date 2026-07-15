@@ -349,6 +349,8 @@ class OpenClawBridge:
             "idempotencyKey": idempotency_key,
             "sessionKey": session_key,
             "message": final_message,
+            "thinking": config.OPENCLAW_THINKING_LEVEL,
+            "fastMode": config.OPENCLAW_FAST_MODE,
         }
 
         try:
