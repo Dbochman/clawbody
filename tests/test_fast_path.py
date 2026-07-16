@@ -397,6 +397,11 @@ class MicrophoneToolTests(unittest.IsolatedAsyncioTestCase):
             ) as request,
             patch.object(core_tools, "_last_unmuted_microphone_volume", 100),
             patch.object(core_tools, "_set_microphone_pose") as set_pose,
+            patch.object(
+                core_tools,
+                "_configure_antenna_unmute_watcher",
+                new=AsyncMock(),
+            ) as configure_watcher,
         ):
             muted = await dispatch_tool_call(
                 "microphone", '{"action":"mute"}', deps
@@ -424,6 +429,64 @@ class MicrophoneToolTests(unittest.IsolatedAsyncioTestCase):
                 call(37),
             ],
         )
+        self.assertEqual(
+            configure_watcher.call_args_list,
+            [
+                call(deps, armed=False),
+                call(deps, armed=True),
+                call(deps, armed=False),
+            ],
+        )
+
+    def test_physical_unmute_requires_both_antennas_for_three_samples(self) -> None:
+        detector = core_tools.DualAntennaGestureDetector()
+
+        self.assertFalse(detector.update((0.0, 0.0)))
+        self.assertFalse(detector.update((0.30, 0.05)))
+        self.assertFalse(detector.update((0.30, -0.30)))
+        self.assertFalse(detector.update((0.30, -0.30)))
+        self.assertTrue(detector.update((0.30, -0.30)))
+
+    async def test_two_antenna_gesture_unmutes_and_restores_torque(self) -> None:
+        robot = SimpleNamespace(
+            disable_motors=Mock(),
+            enable_motors=Mock(),
+            get_present_antenna_joint_positions=Mock(
+                side_effect=[
+                    (0.0, 0.0),
+                    (0.30, 0.05),
+                    (0.30, -0.30),
+                    (0.30, -0.30),
+                    (0.30, -0.30),
+                ]
+            ),
+        )
+        deps = SimpleNamespace(robot=robot)
+
+        with (
+            patch.object(
+                core_tools,
+                "_microphone_volume_request",
+                return_value={"volume": 37},
+            ) as request,
+            patch.object(core_tools, "_last_unmuted_microphone_volume", 37),
+            patch.object(core_tools, "_set_microphone_pose") as set_pose,
+        ):
+            await core_tools._watch_antennas_for_unmute(
+                deps,
+                settle_seconds=0,
+                poll_seconds=0,
+            )
+
+        robot.disable_motors.assert_called_once_with(
+            ids=core_tools.ANTENNA_MOTOR_IDS
+        )
+        robot.enable_motors.assert_called_once_with(
+            ids=core_tools.ANTENNA_MOTOR_IDS
+        )
+        self.assertEqual(robot.get_present_antenna_joint_positions.call_count, 5)
+        request.assert_called_once_with(37)
+        set_pose.assert_called_once_with(deps, muted=False)
 
     async def test_rejects_unknown_microphone_action(self) -> None:
         result = await dispatch_tool_call(

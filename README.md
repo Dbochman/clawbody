@@ -295,7 +295,7 @@ ClawBody gives Clawson these physical abilities:
 | **Emotions** | Express emotions through movement (happy, curious, thinking, etc.) |
 | **Speak** | Voice output through the robot's speaker |
 | **Listen** | Hear through the robot's microphone |
-| **Mute** | Mute its microphone on request and hold a bowed quiet pose; restore it through Reachy's UI or an authenticated remote control command |
+| **Mute** | Mute its microphone on request and hold a bowed quiet pose; move both relaxed antennas together to unmute, or restore it through Reachy's UI or an authenticated remote control command |
 
 ## 🖥️ Simulator Features
 

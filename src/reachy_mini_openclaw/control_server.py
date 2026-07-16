@@ -114,6 +114,7 @@ class ClawBodyControlServer:
             ),
             "microphone_muted": microphone.get("microphone_muted", "unknown"),
             "microphone_volume": microphone.get("microphone_volume", "unknown"),
+            "antenna_unmute": microphone.get("antenna_unmute", "unknown"),
         }
 
     async def _execute(self, request: Any) -> dict[str, Any]:

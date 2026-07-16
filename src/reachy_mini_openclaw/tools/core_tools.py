@@ -45,6 +45,37 @@ EMOTION_ALIASES = {
 _recorded_libraries: dict[str, Any] = {}
 _recorded_libraries_lock = threading.Lock()
 _last_unmuted_microphone_volume = 100
+_antenna_unmute_task: asyncio.Task[None] | None = None
+
+ANTENNA_MOTOR_IDS = ["right_antenna", "left_antenna"]
+ANTENNA_UNMUTE_SETTLE_SECONDS = 1.0
+ANTENNA_UNMUTE_POLL_SECONDS = 0.1
+ANTENNA_UNMUTE_DELTA_RAD = 0.25
+ANTENNA_UNMUTE_CONSECUTIVE_SAMPLES = 3
+
+
+@dataclass
+class DualAntennaGestureDetector:
+    """Detect a sustained, deliberate displacement of both antennas."""
+
+    threshold_rad: float = ANTENNA_UNMUTE_DELTA_RAD
+    required_samples: int = ANTENNA_UNMUTE_CONSECUTIVE_SAMPLES
+    reference: tuple[float, float] | None = None
+    consecutive_samples: int = 0
+
+    def update(self, present: tuple[float, float]) -> bool:
+        if self.reference is None:
+            self.reference = present
+            return False
+
+        displaced = all(
+            abs(position - reference) >= self.threshold_rad
+            for position, reference in zip(present, self.reference)
+        )
+        self.consecutive_samples = (
+            self.consecutive_samples + 1 if displaced else 0
+        )
+        return self.consecutive_samples >= self.required_samples
 
 
 def _microphone_volume_request(volume: int | None = None) -> dict[str, Any]:
@@ -597,6 +628,8 @@ async def _handle_microphone(args: dict, deps: ToolDependencies) -> dict:
         return {"error": "Microphone action must be mute, unmute, or status"}
 
     try:
+        if action in {"mute", "unmute"}:
+            await _configure_antenna_unmute_watcher(deps, armed=False)
         current = await asyncio.to_thread(_microphone_volume_request)
         current_volume = current["volume"]
         if action == "mute":
@@ -615,6 +648,7 @@ async def _handle_microphone(args: dict, deps: ToolDependencies) -> dict:
             "status": "success",
             "microphone_muted": volume == 0,
             "microphone_volume": volume,
+            "antenna_unmute": _antenna_unmute_state(),
         }
         if action in {"mute", "unmute"}:
             try:
@@ -622,6 +656,9 @@ async def _handle_microphone(args: dict, deps: ToolDependencies) -> dict:
                 response["visual_indicator"] = (
                     "muted_pose" if volume == 0 else "released"
                 )
+                if volume == 0:
+                    await _configure_antenna_unmute_watcher(deps, armed=True)
+                response["antenna_unmute"] = _antenna_unmute_state()
             except Exception as e:
                 logger.error("Could not update muted pose: %s", e, exc_info=True)
                 response["status"] = "partial"
@@ -630,6 +667,110 @@ async def _handle_microphone(args: dict, deps: ToolDependencies) -> dict:
         return response
     except Exception as e:
         return {"error": str(e)}
+
+
+def _antenna_unmute_state() -> str:
+    task = _antenna_unmute_task
+    return "armed" if task is not None and not task.done() else "inactive"
+
+
+async def _configure_antenna_unmute_watcher(
+    deps: ToolDependencies,
+    *,
+    armed: bool,
+) -> None:
+    """Replace the one-shot physical unmute watcher."""
+    global _antenna_unmute_task
+
+    previous = _antenna_unmute_task
+    _antenna_unmute_task = None
+    if previous is not None and previous is not asyncio.current_task():
+        if not previous.done():
+            previous.cancel()
+        try:
+            await previous
+        except asyncio.CancelledError:
+            pass
+
+    if not armed:
+        return
+
+    task = asyncio.create_task(
+        _watch_antennas_for_unmute(deps),
+        name="clawbody-antenna-unmute",
+    )
+    _antenna_unmute_task = task
+
+    def clear_finished(done: asyncio.Task[None]) -> None:
+        global _antenna_unmute_task
+        if _antenna_unmute_task is done:
+            _antenna_unmute_task = None
+
+    task.add_done_callback(clear_finished)
+
+
+async def _watch_antennas_for_unmute(
+    deps: ToolDependencies,
+    *,
+    settle_seconds: float = ANTENNA_UNMUTE_SETTLE_SECONDS,
+    poll_seconds: float = ANTENNA_UNMUTE_POLL_SECONDS,
+) -> None:
+    """Relax antenna torque and unmute after a sustained two-antenna gesture."""
+    torque_relaxed = False
+    try:
+        await asyncio.sleep(settle_seconds)
+        await asyncio.to_thread(
+            deps.robot.disable_motors,
+            ids=ANTENNA_MOTOR_IDS,
+        )
+        torque_relaxed = True
+        detector = DualAntennaGestureDetector()
+        logger.info(
+            "Physical unmute armed: move both antennas by at least %.2f rad",
+            ANTENNA_UNMUTE_DELTA_RAD,
+        )
+
+        while True:
+            values = await asyncio.to_thread(
+                deps.robot.get_present_antenna_joint_positions
+            )
+            try:
+                present = (float(values[0]), float(values[1]))
+            except (IndexError, TypeError, ValueError) as exc:
+                raise ValueError("invalid antenna encoder positions") from exc
+
+            if detector.update(present):
+                restore_volume = max(1, _last_unmuted_microphone_volume)
+                result = await asyncio.to_thread(
+                    _microphone_volume_request,
+                    restore_volume,
+                )
+                if result["volume"] <= 0:
+                    raise RuntimeError("antenna gesture did not restore microphone")
+                _set_microphone_pose(deps, muted=False)
+                # Let the movement loop publish a neutral target before antenna
+                # torque returns, avoiding a snap back to the held mute pose.
+                await asyncio.sleep(0.12)
+                logger.info(
+                    "Microphone unmuted by two-antenna gesture at volume %d",
+                    result["volume"],
+                )
+                return
+
+            await asyncio.sleep(poll_seconds)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Physical antenna unmute watcher failed: %s", exc, exc_info=True)
+    finally:
+        if torque_relaxed:
+            try:
+                await asyncio.to_thread(
+                    deps.robot.enable_motors,
+                    ids=ANTENNA_MOTOR_IDS,
+                )
+            except Exception as exc:
+                logger.error("Could not re-enable antenna motors: %s", exc)
 
 
 def _set_microphone_pose(deps: ToolDependencies, *, muted: bool) -> None:
