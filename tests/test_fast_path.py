@@ -1,7 +1,8 @@
 import asyncio
+import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import numpy as np
@@ -386,6 +387,8 @@ class MicrophoneToolTests(unittest.IsolatedAsyncioTestCase):
             {"volume": 37},
         ]
 
+        deps = SimpleNamespace()
+
         with (
             patch.object(
                 core_tools,
@@ -393,18 +396,25 @@ class MicrophoneToolTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=responses,
             ) as request,
             patch.object(core_tools, "_last_unmuted_microphone_volume", 100),
+            patch.object(core_tools, "_set_microphone_pose") as set_pose,
         ):
             muted = await dispatch_tool_call(
-                "microphone", '{"action":"mute"}', SimpleNamespace()
+                "microphone", '{"action":"mute"}', deps
             )
             unmuted = await dispatch_tool_call(
-                "microphone", '{"action":"unmute"}', SimpleNamespace()
+                "microphone", '{"action":"unmute"}', deps
             )
 
         self.assertEqual(muted["microphone_volume"], 0)
         self.assertTrue(muted["microphone_muted"])
         self.assertEqual(unmuted["microphone_volume"], 37)
         self.assertFalse(unmuted["microphone_muted"])
+        self.assertEqual(muted["visual_indicator"], "muted_pose")
+        self.assertEqual(unmuted["visual_indicator"], "released")
+        self.assertEqual(
+            set_pose.call_args_list,
+            [call(deps, muted=True), call(deps, muted=False)],
+        )
         self.assertEqual(
             request.call_args_list,
             [
@@ -421,6 +431,43 @@ class MicrophoneToolTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("must be mute, unmute, or status", result["error"])
+
+    def test_muted_pose_pauses_tracking_and_unmute_restores_it(self) -> None:
+        muted_move = object()
+        neutral_move = object()
+        moves = ModuleType("reachy_mini_openclaw.moves")
+        moves.MutedPoseMove = Mock(return_value=muted_move)
+        moves.HeadLookMove = Mock(return_value=neutral_move)
+        movement = SimpleNamespace(
+            set_listening=Mock(),
+            set_processing=Mock(),
+            clear_move_queue=Mock(),
+            queue_move=Mock(),
+        )
+        robot = SimpleNamespace(
+            get_current_joint_positions=Mock(return_value=([], [0.1, -0.1])),
+            get_current_head_pose=Mock(return_value="current-head"),
+            stop_head_tracking=Mock(),
+            start_head_tracking=Mock(),
+        )
+        deps = SimpleNamespace(
+            movement_manager=movement,
+            robot=robot,
+            daemon_face_tracking=True,
+        )
+
+        with patch.dict(sys.modules, {"reachy_mini_openclaw.moves": moves}):
+            core_tools._set_microphone_pose(deps, muted=True)
+            core_tools._set_microphone_pose(deps, muted=False)
+
+        movement.set_listening.assert_has_calls([call(False), call(False)])
+        movement.set_processing.assert_has_calls([call(False), call(False)])
+        self.assertEqual(
+            movement.queue_move.call_args_list,
+            [call(muted_move), call(neutral_move)],
+        )
+        robot.stop_head_tracking.assert_called_once_with()
+        robot.start_head_tracking.assert_called_once_with(weight=0.25)
 
 
 class DirectVoicePromptTests(unittest.TestCase):

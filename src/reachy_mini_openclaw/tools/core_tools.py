@@ -590,7 +590,6 @@ async def _handle_presets(args: dict, deps: ToolDependencies) -> dict:
 
 async def _handle_microphone(args: dict, deps: ToolDependencies) -> dict:
     """Mute, restore, or inspect the daemon-managed microphone input volume."""
-    del deps
     global _last_unmuted_microphone_volume
 
     action = args.get("action")
@@ -612,13 +611,58 @@ async def _handle_microphone(args: dict, deps: ToolDependencies) -> dict:
         else:
             result = current
         volume = result["volume"]
-        return {
+        response = {
             "status": "success",
             "microphone_muted": volume == 0,
             "microphone_volume": volume,
         }
+        if action in {"mute", "unmute"}:
+            try:
+                _set_microphone_pose(deps, muted=volume == 0)
+                response["visual_indicator"] = (
+                    "muted_pose" if volume == 0 else "released"
+                )
+            except Exception as e:
+                logger.error("Could not update muted pose: %s", e, exc_info=True)
+                response["status"] = "partial"
+                response["visual_indicator"] = "error"
+                response["visual_indicator_error"] = str(e)
+        return response
     except Exception as e:
         return {"error": str(e)}
+
+
+def _set_microphone_pose(deps: ToolDependencies, *, muted: bool) -> None:
+    """Hold or release the physical microphone-state indicator."""
+    from reachy_mini_openclaw.moves import HeadLookMove, MutedPoseMove
+
+    movement = deps.movement_manager
+    movement.set_listening(False)
+    movement.set_processing(False)
+    movement.clear_move_queue()
+
+    _, current_antennas = deps.robot.get_current_joint_positions()
+    current_head = deps.robot.get_current_head_pose()
+    if muted:
+        if deps.daemon_face_tracking:
+            deps.robot.stop_head_tracking()
+        movement.queue_move(
+            MutedPoseMove(
+                start_pose=current_head,
+                start_antennas=tuple(current_antennas),
+            )
+        )
+    else:
+        movement.queue_move(
+            HeadLookMove(
+                direction="front",
+                start_pose=current_head,
+                start_antennas=tuple(current_antennas),
+                duration=0.8,
+            )
+        )
+        if deps.daemon_face_tracking:
+            deps.robot.start_head_tracking(weight=0.25)
 
 
 async def _handle_stop_moves(args: dict, deps: ToolDependencies) -> dict:

@@ -170,6 +170,48 @@ class HeadLookMove(Move):
         return (head_pose, antennas.astype(np.float64), 0.0)
 
 
+class MutedPoseMove(Move):
+    """Hold a recognizable bowed pose while microphone input is muted."""
+
+    def __init__(
+        self,
+        start_pose: NDArray[np.float32],
+        start_antennas: Tuple[float, float],
+        interpolation_duration: float = 0.8,
+    ):
+        self.start_pose = start_pose
+        self.start_antennas = np.array(start_antennas)
+        self.interpolation_duration = interpolation_duration
+        self.target_pose = create_head_pose(
+            x=0,
+            y=0,
+            z=-4,
+            roll=0,
+            pitch=-14,
+            yaw=0,
+            degrees=True,
+            mm=True,
+        )
+        self.target_antennas = np.deg2rad(np.array([55.0, -55.0]))
+
+    @property
+    def duration(self) -> float:
+        return float("inf")
+
+    def evaluate(self, t: float) -> tuple:
+        alpha = min(1.0, t / self.interpolation_duration)
+        alpha = alpha * alpha * (3 - 2 * alpha)
+        head_pose = linear_pose_interpolation(
+            self.start_pose,
+            self.target_pose,
+            alpha,
+        )
+        antennas = (
+            (1 - alpha) * self.start_antennas + alpha * self.target_antennas
+        )
+        return (head_pose, antennas.astype(np.float64), 0.0)
+
+
 class ExpressiveDanceMove(Move):
     """A visible, dependency-free dance that returns smoothly to neutral."""
 
