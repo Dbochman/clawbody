@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import numpy as np
 
@@ -16,6 +16,8 @@ from reachy_mini_openclaw.openclaw_bridge import (
     OpenClawBridge,
     OpenClawContinuityError,
 )
+from reachy_mini_openclaw.tools import core_tools
+from reachy_mini_openclaw.tools.core_tools import dispatch_tool_call
 from reachy_mini_openclaw.wake_word import WAKE_FRAME_SAMPLES, WakeWordGate
 
 
@@ -353,6 +355,72 @@ class ControlLeaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"status": "success"})
         self.assertEqual(events, ["acquire:speak", "speak:Hello", "release"])
+
+    async def test_mute_alias_uses_the_microphone_tool(self) -> None:
+        server = ClawBodyControlServer(SimpleNamespace())
+
+        with patch(
+            "reachy_mini_openclaw.control_server.dispatch_tool_call",
+            new=AsyncMock(
+                return_value={
+                    "status": "success",
+                    "microphone_muted": True,
+                    "microphone_volume": 0,
+                }
+            ),
+        ) as dispatch:
+            result = await server._execute({"command": "mute", "arguments": {}})
+
+        self.assertTrue(result["microphone_muted"])
+        dispatch.assert_awaited_once_with(
+            "microphone", '{"action": "mute"}', server.deps
+        )
+
+
+class MicrophoneToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mute_and_unmute_restore_the_previous_volume(self) -> None:
+        responses = [
+            {"volume": 37},
+            {"volume": 0},
+            {"volume": 0},
+            {"volume": 37},
+        ]
+
+        with (
+            patch.object(
+                core_tools,
+                "_microphone_volume_request",
+                side_effect=responses,
+            ) as request,
+            patch.object(core_tools, "_last_unmuted_microphone_volume", 100),
+        ):
+            muted = await dispatch_tool_call(
+                "microphone", '{"action":"mute"}', SimpleNamespace()
+            )
+            unmuted = await dispatch_tool_call(
+                "microphone", '{"action":"unmute"}', SimpleNamespace()
+            )
+
+        self.assertEqual(muted["microphone_volume"], 0)
+        self.assertTrue(muted["microphone_muted"])
+        self.assertEqual(unmuted["microphone_volume"], 37)
+        self.assertFalse(unmuted["microphone_muted"])
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call(),
+                call(0),
+                call(),
+                call(37),
+            ],
+        )
+
+    async def test_rejects_unknown_microphone_action(self) -> None:
+        result = await dispatch_tool_call(
+            "microphone", '{"action":"toggle"}', SimpleNamespace()
+        )
+
+        self.assertIn("must be mute, unmute, or status", result["error"])
 
 
 class DirectVoicePromptTests(unittest.TestCase):

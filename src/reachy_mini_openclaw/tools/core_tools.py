@@ -9,19 +9,20 @@ Tool Categories:
 """
 
 import asyncio
+import base64
 import json
 import logging
-import base64
 import threading
-from dataclasses import dataclass
+import urllib.request
 from collections.abc import Callable
-from typing import Any, Optional, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 
 if TYPE_CHECKING:
-    from reachy_mini_openclaw.moves import MovementManager, HeadLookMove
     from reachy_mini_openclaw.audio.head_wobbler import HeadWobbler
+    from reachy_mini_openclaw.moves import HeadLookMove, MovementManager
     from reachy_mini_openclaw.openclaw_bridge import OpenClawBridge
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,32 @@ EMOTION_ALIASES = {
 }
 _recorded_libraries: dict[str, Any] = {}
 _recorded_libraries_lock = threading.Lock()
+_last_unmuted_microphone_volume = 100
+
+
+def _microphone_volume_request(volume: int | None = None) -> dict[str, Any]:
+    """Read or set Reachy's daemon-managed microphone volume."""
+    if volume is None:
+        path = "/api/volume/microphone/current"
+        request = urllib.request.Request(f"http://127.0.0.1:8000{path}")
+    else:
+        path = "/api/volume/microphone/set"
+        body = json.dumps({"volume": volume}).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:8000{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+    with urllib.request.urlopen(request, timeout=3) as response:
+        payload = json.load(response)
+    if not isinstance(payload, dict):
+        raise ValueError("Reachy daemon returned an invalid microphone response")
+    returned_volume = payload.get("volume")
+    if not isinstance(returned_volume, int) or not 0 <= returned_volume <= 100:
+        raise ValueError("Reachy daemon returned an invalid microphone volume")
+    return payload
 
 
 def _get_recorded_library(kind: str) -> Any:
@@ -71,6 +98,7 @@ async def _analyze_image_with_openai(frame: np.ndarray, prompt: str) -> Optional
     try:
         import cv2
         from openai import AsyncOpenAI
+
         from reachy_mini_openclaw.config import config
 
         api_key = config.OPENAI_API_KEY
@@ -218,6 +246,26 @@ TOOL_SPECS = [
     },
     {
         "type": "function",
+        "name": "microphone",
+        "description": (
+            "Mute or unmute your own microphone, or check its state. Use mute only "
+            "when the user directly asks. After muting you cannot hear a spoken "
+            "unmute request; the user must use Reachy's UI or OpenClaw remotely."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["mute", "unmute", "status"],
+                    "description": "The microphone action to perform."
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "type": "function",
         "name": "stop_moves",
         "description": "Stop all current movements and clear the movement queue.",
         "parameters": {
@@ -275,6 +323,7 @@ async def dispatch_tool_call(
         "dance": _handle_dance,
         "emotion": _handle_emotion,
         "presets": _handle_presets,
+        "microphone": _handle_microphone,
         "stop_moves": _handle_stop_moves,
         "idle": _handle_idle,
     }
@@ -534,6 +583,39 @@ async def _handle_presets(args: dict, deps: ToolDependencies) -> dict:
             "vocalized_emotions": vocalized_emotions,
             "silent_emotions": sorted(emotion_presets - set(vocalized_emotions)),
             "official_dances_are_motion_only": True,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _handle_microphone(args: dict, deps: ToolDependencies) -> dict:
+    """Mute, restore, or inspect the daemon-managed microphone input volume."""
+    del deps
+    global _last_unmuted_microphone_volume
+
+    action = args.get("action")
+    if action not in {"mute", "unmute", "status"}:
+        return {"error": "Microphone action must be mute, unmute, or status"}
+
+    try:
+        current = await asyncio.to_thread(_microphone_volume_request)
+        current_volume = current["volume"]
+        if action == "mute":
+            if current_volume > 0:
+                _last_unmuted_microphone_volume = current_volume
+            result = await asyncio.to_thread(_microphone_volume_request, 0)
+        elif action == "unmute":
+            restore_volume = max(1, _last_unmuted_microphone_volume)
+            result = await asyncio.to_thread(
+                _microphone_volume_request, restore_volume
+            )
+        else:
+            result = current
+        volume = result["volume"]
+        return {
+            "status": "success",
+            "microphone_muted": volume == 0,
+            "microphone_volume": volume,
         }
     except Exception as e:
         return {"error": str(e)}

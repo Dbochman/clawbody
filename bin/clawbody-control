@@ -34,6 +34,8 @@ def parse_args() -> tuple[str, dict]:
     subparsers.add_parser("see")
     subparsers.add_parser("stop")
     subparsers.add_parser("idle")
+    subparsers.add_parser("mute")
+    subparsers.add_parser("unmute")
 
     args = parser.parse_args()
     if args.command == "look":

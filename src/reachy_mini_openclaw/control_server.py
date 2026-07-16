@@ -16,6 +16,8 @@ DEFAULT_SOCKET_PATH = f"/run/user/{os.getuid()}/clawbody-control.sock"
 COMMAND_ALIASES = {
     "see": "camera",
     "stop": "stop_moves",
+    "mute": "microphone",
+    "unmute": "microphone",
 }
 ALLOWED_COMMANDS = {
     "look",
@@ -23,6 +25,7 @@ ALLOWED_COMMANDS = {
     "dance",
     "emotion",
     "presets",
+    "microphone",
     "stop_moves",
     "idle",
 }
@@ -91,6 +94,9 @@ class ClawBodyControlServer:
         except Exception as exc:
             logger.debug("Could not read tracked face: %s", exc)
 
+        microphone = await dispatch_tool_call(
+            "microphone", json.dumps({"action": "status"}), self.deps
+        )
         return {
             "status": "success",
             "app": "clawbody",
@@ -106,6 +112,8 @@ class ClawBodyControlServer:
             "wake_word_state": (
                 self._wake_status_callback() if self._wake_status_callback else "disabled"
             ),
+            "microphone_muted": microphone.get("microphone_muted", "unknown"),
+            "microphone_volume": microphone.get("microphone_volume", "unknown"),
         }
 
     async def _execute(self, request: Any) -> dict[str, Any]:
@@ -134,6 +142,8 @@ class ClawBodyControlServer:
                     return {"error": "Speech transport is not ready"}
                 return await self._speak_callback(text)
 
+            if command in {"mute", "unmute"}:
+                arguments = {"action": command}
             command = COMMAND_ALIASES.get(command, command)
             if command not in ALLOWED_COMMANDS:
                 return {"error": f"Unsupported command: {command}"}
